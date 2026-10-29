@@ -61,3 +61,10 @@ against these family signatures. Matching one family on 4+/5 texts = WEAK FOR
 (R8 - usage is forgeable). Matching none while landing near an excluded or
 unscaned family is disagreement evidence only if the gap exceeds tokenizer
 sloppiness margins - re-run with fresh texts before concluding.
+
+### Cross-provider check (2026-10-29)
+
+`deepseek-ai/DeepSeek-V4.1-Flash-1017` on **api.river.ai** (OpenAI dialect,
+prompt-only, mt16, control 5) measured deltas `(27, 26, 23, 32, 25)` -
+5/5 match with the measured deepseek family signature above. Same tokenizer
+family across providers; proves the counting dialect, not the weights (R8).
