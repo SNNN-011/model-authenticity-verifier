@@ -42,10 +42,13 @@ delta(T) = input_tokens(T) - input_tokens("a"), per path, stream off.
   matches the public recipe's DeepSeek route. The two models report
   different raw control counts (5 vs 31) - different path overhead, equal
   deltas, which is exactly what the subtraction is for.
-- **deepseek-v4-flash**: (27, 88, 85, 94, 87) - anomalous. Same T1 as pro but
-  3-4x higher on the other four texts; this route also 502s at small
-  `max_tokens` (hidden-reasoning budget), so its usage path is not trusted
-  until re-run with a larger budget.
+- **deepseek-v4-flash**: (27, 88, 85, 94, 87) on the first scan - **superseded
+  by a retest, not usable as a reference**. Retest 2026-10-29 (two passes):
+  at mt16 the deltas read 27, 26, 23, (T4 502), 26 - family-consistent;
+  raw usage is unstable across runs/max_tokens (control "a" 22 -> 5 -> 31;
+  T2 110 -> 31; at mt2048 T4 computes to 6 against a 31-token control, which
+  contradicts its mt16 value). Treat this route's input accounting as
+  nondeterministic (SERVICE finding): do not fingerprint it until it is stable.
 
 ## Anomalies
 
