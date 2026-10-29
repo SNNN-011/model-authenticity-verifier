@@ -82,7 +82,9 @@ hundreds to thousands of tokens — so the 5-token gap is template /
 system-prompt sized, and the input tokenization is effectively identical.
 **Caveat (R6):** if the gateway re-tokenizes locally with a single tokenizer for
 all routes, this says nothing about the upstream model. Distinguishing the two
-cases needs a third control route, which was not run in this session.
+cases needs a third control route, which was not run in this session. The
+session-2 input-side diff (baseline subtraction per path) removes the need for
+the control route to interpret overhead.
 
 ### Lessons
 
@@ -95,3 +97,47 @@ cases needs a third control route, which was not run in this session.
   same-model when most items have canonical answers. Weight by item type.
 - `completion_tokens` inflation on identical visible output is a useful
   hidden-reasoning tell on OpenAI-compatible routes.
+
+---
+
+## Session 2: input-side tokenizer diff via public recipe (2026-10-18, field note)
+
+Method circulated publicly (a public audit post post, date published with the raw delta
+table). Recorded here as the field basis for the manual probe in SKILL.md.
+
+### Recipe, as published
+
+- On each path to be compared, send two prompt-only messages, `"stream": false`:
+  the probe text T, then the control "a" (1 token).
+- delta(T) = input_tokens(T) - input_tokens("a") per path; the subtraction
+  cancels that path's template/system overhead, so raw counts need not line up
+  and no second control route is required.
+- Compare deltas across paths, not raw counts.
+
+### Published delta table (2026-10-18), claim: Claude Opus 5.5 via Anthropic dialect
+
+| Probe text | Official Anthropic path | suspect path | DeepSeek-family route |
+|---|---|---|---|
+| Indonesian accusation sentence + clown emoji | 45 | 45 | 27 |
+| Javanese + food, price "Rp17.500" | 42 | 42 | 29 |
+| JS one-liner (`items.reduce(`) | 36 | 36 | 30 |
+| Mixed CJK + emoji + arithmetic | 33 | 33 | 20 |
+
+4/4 delta match on the suspect path; the DeepSeek-family tokenization reads
+1.2-1.9x lower per text. On the first text the GPT-6.x and Qwen-family routes
+read 24/25 - different families give different deltas, family agreement over
+several texts is the signal.
+
+### Lessons (folded into SKILL.md)
+
+- Baseline subtraction ("a") kills the overhead-size problem session 1's
+  identical-text check hit: that check needed a third control route to explain
+  a 5-token gap; the "a"-baseline needs nothing extra.
+- Probe selection is a failure mode in itself: repeated plain ASCII ("aaaa")
+  tokenizes the same across families and proves nothing. The differentiator is
+  multilingual mixed-script + emoji + code text (1.2-1.9x family spread here).
+- Works when completions are capped/mutated - prompt-only input, no forced
+  output needed - and it is two cheap requests per text.
+- Still R8-WEAK: counts can be forged by counting with the claimed family's
+  tokenizer kept locally; match gates the dialect, not the weights. Repeat the
+  text set (4 different texts here) before calling anything "consistent".
