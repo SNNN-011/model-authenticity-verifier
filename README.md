@@ -40,6 +40,12 @@ what the data supports — nothing more.
 - **Logprobs distribution probe** *(optional)* — top-1 next-token and
   `|delta logprob|` comparison, the strongest non-attested signal when both
   endpoints expose it.
+- **Input-side tokenizer diff** *(manual probe)* — fingerprint the tokenizer
+  from `usage.input_tokens` / `prompt_tokens` of prompt-only messages:
+  `tokens(T) - tokens("a")` per path cancels per-path overhead without a
+  third control route. Works when completions are capped/mutated. Measured
+  per-family the gateway deltas ship in
+  [`references/tokenizer-baselines-2026-10.md`](references/tokenizer-baselines-2026-10.md).
 
 ## How it works
 
@@ -115,6 +121,27 @@ On Windows use `python` instead of `python3`; set the key with
 Default probe set is `infra,service,caps,self`. Keys come from `--key` /
 `--baseline-key`, or `VERIFY_API_KEY` / `VERIFY_BASELINE_API_KEY`. Keys are never
 printed or written to the report.
+
+## Models with a measured tokenizer baseline (the gateway, 2026-10-29)
+
+The input-side diff was measured against `the audited gateway` (11 of 32 models,
+partial run). A new audit can compare a gateway's deltas straight against
+these signatures (full method, anomalies, and usage rules: the
+[baseline file](references/tokenizer-baselines-2026-10.md)):
+
+| Claimed model → check against | Delta signature T1–T5 |
+|---|---|
+| `claude-opus-4.7` / `-4.8` / `-5`, `claude-sonnet-5` (Anthropic core) | `45 40 35 45 47` |
+| `claude-opus-4.6` / `claude-sonnet-4.6` (older-generation branch) | `35 34 29 46 47` |
+| `gpt-5.6-terra` / `gpt-5.6-sol` (OpenAI family) | `24 24 22 30 29` |
+| `deepseek-v4-pro`, `deepseek-v4.1-flash-1017` | `27 26 23 32 25` |
+| `deepseek-v4-flash` | anomalous - do not use as a reference until re-run |
+
+Not yet measured on the gateway: the 5.5-generation Claude models (opus/sonnet/haiku),
+gpt-6*, gemini, glm/zai, minimax, moonshot kimi, qwen, xiaomi, and the
+`uncensored/*` uncensored twin. Two fable models and `gpt-6-astra` were excluded
+by request. A signature match is WEAK evidence (usage is forgeable, rule R8) -
+score family agreement across texts, never a single text.
 
 ## Evidence model (the ground rules)
 
