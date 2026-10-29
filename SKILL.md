@@ -67,7 +67,7 @@ anti-forgery cross-check on token counts, latency/throughput telemetry.
 | TEE attestation (signed inference) | Definitive (current state of art) | Provider runs attested hardware (rare) |
 | **Differential testing vs official endpoint** | Strong evidence | Official API key for the claimed model |
 | Logprobs distribution comparison (`--logprobs`) | Strong evidence | Both endpoints expose logprobs (gateways often strip it) |
-| Tokenizer signature (completion_tokens on forced output) | Weak (usage is forgeable; cross-checked before use) | Baseline for comparison |
+| Tokenizer signature (completion_tokens on forced output, or input-side diff - see manual probe below) | Weak (usage is forgeable; cross-checked before use) | Baseline for comparison |
 | Capability battery + context/long-output probes | Moderate (detects tier gaps) | Working endpoint |
 | Behavioral/style profiling | Moderate (top-tier discrimination) | Careful analysis, converging capabilities |
 | Gateway field/header fingerprint | Infrastructure attribution only | Working endpoint |
@@ -77,6 +77,34 @@ Important caveat from the research: parameter-independent modifications (system
 prompts, RAG, wrappers) *degrade* fingerprint reliability, and top-tier models
 converge on core capabilities - so style/structure agreement carries information
 that raw capability scores do not. See `references/methodology.md`.
+
+## Input-side tokenizer diff (manual probe - no forced output needed)
+
+The collector's tokenizer comparison runs from the output side (completion_tokens
+of a forced response). The input side works too, from `usage.input_tokens`
+(Anthropic dialect) or `usage.prompt_tokens` (OpenAI dialect), so it also covers
+gateways that cap or mutate completions. Two prompt-only requests per item:
+
+1. On the SAME path, send the probe text T, then a 1-token control ("a").
+   Both prompt-only, `"stream": false`.
+2. delta(T) = tokens(T) - tokens("a"). The subtraction cancels that path's
+   template / system-prompt overhead, so no third control route is needed
+   (contrast: the identical-text check in October-2026 session 1).
+3. Compare deltas across paths - suspect gateway vs official endpoint or a
+   documented per-family reference table. Matching deltas = same tokenizer.
+
+Field lessons (public recipe, 2026-10-18, see session notes):
+
+- Pick texts that DIVIDE families: mixed-script multilingual prose, emoji
+  sequences, code one-liners, mixed arithmetic. A 4-text delta battery matched
+  the official path 4/4 while wrong-family routes read 1.2-1.9x lower; one
+  text is not a fingerprint, family agreement over several texts is.
+- Plain repeated ASCII ("aaaa") and long plain English prose agree across most
+  families - they prove nothing. Weird text only.
+- Terminal rule stays R8: usage is computed by whatever counts on the gateway
+  side, and a determined proxy can count with a locally kept copy of the claimed
+  family's tokenizer without ever serving it. Delta match = WEAK FOR; it gates
+  the dialect, not the weights.
 
 ## Workflow
 
