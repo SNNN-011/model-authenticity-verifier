@@ -10,6 +10,10 @@
 
 Part of the [Everything Claude Code](https://github.com/affaan-m/ECC) skill collection
 
+**[One-page site](https://snnn-011.github.io/model-authenticity-verifier/)** ·
+[SKILL.md](SKILL.md) ·
+[Methodology](references/methodology.md)
+
 </div>
 
 ---
@@ -196,6 +200,7 @@ SKILL.md                        agent-facing instructions, ground rules, workflo
 scripts/verify_gateway.py       the collector (stdlib only, selftest included)
 references/methodology.md       research basis, probe-to-paper mapping, rules R1-R8
 references/probe-sessions-*.md  real field logs with raw numbers
+docs/                           the one-page site (GitHub Pages, no build step)
 ```
 
 ## License
