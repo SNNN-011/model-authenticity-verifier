@@ -801,6 +801,33 @@ h3 {
 
 .foot-mark text { font-size: 92px; }
 
+/* ---------- 404 ---------- */
+
+.miss {
+  min-height: 100svh;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: flex-start;
+  gap: 30px;
+  padding: 40px var(--margin);
+  background: var(--bg);
+}
+
+.miss-word {
+  font-size: var(--display);
+  line-height: 0.95;
+  letter-spacing: -0.05em;
+  font-weight: 600;
+}
+
+.miss-say {
+  font-size: var(--body);
+  max-width: 52ch;
+}
+
+.miss .button { align-self: flex-start; }
+
 /* ---------- tablet ---------- */
 
 @media (max-width: 1200px) {
