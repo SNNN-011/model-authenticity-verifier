@@ -4,7 +4,7 @@
 
 **Is the model behind that gateway really what the label says?**
 
-![version](https://img.shields.io/badge/skill-v2.2-1f6feb)
+![version](https://img.shields.io/badge/skill-v3.0-1f6feb)
 ![python](https://img.shields.io/badge/python-stdlib%20only-3776AB?logo=python&logoColor=white)
 ![license](https://img.shields.io/badge/license-MIT-2ea44f)
 
@@ -18,191 +18,149 @@ Part of the [Everything Claude Code](https://github.com/affaan-m/ECC) skill coll
 
 ---
 
-A gateway sells `claude-opus-4-8` at a tenth of the official price. Three options:
-it is genuine, it is a smaller model with a bigger label, or it is the real thing
-behind a broken proxy. This skill settles the question with **evidence instead of
-vibes**: probe the gateway, build a transparent evidence ledger, and report exactly
-what the data supports — nothing more.
+A gateway sells `claude-opus-4-8` at a tenth of the official price. Three
+options: it is genuine, it is a smaller model with a bigger label, or it is
+the real thing behind a broken proxy. This tool answers the only question a
+bearer-key HTTP endpoint can answer honestly: **does the route count tokens
+the way the claimed family's tokenizer does?**
 
-> [!IMPORTANT]
-> Black-box testing cannot *prove* authenticity. This skill finds contradictions,
-> measures service degradation, and says "no contradiction found" without ever
-> dressing that up as "confirmed genuine".
+## The question
+
+Given a base URL, an API key and a model id, send prompt-only requests and
+read the prompt token count from the response's `usage` block. Subtract a
+one-character control on the same path. Compare the five deltas against the
+measured signature of the claimed model's family.
+
+That is the whole method. One probe family, one comparison, one verdict.
 
 ## What it does
 
-- **Infrastructure & service audit** — wrapper-stack fingerprints (NewAPI etc.),
-  headers, catalog oddities, hidden output caps, response mutation, feature stripping.
-- **Capability battery** — a seedable randomized battery plus a dual-depth needle
-  (25% / 75% into a 120k-character haystack). A "frontier" model that fails
-  multi-step arithmetic or long-context recall has answered the question already.
-- **One-directional self-report** — identity and cutoff probes, sampled twice.
-  Contradiction is evidence; agreement is never scored.
-- **Differential testing** — same prompts against the official vendor endpoint:
-  pass-rate parity, exact-output agreement at temperature 0, forced-output
-  tokenizer signature, open-ended similarity.
-- **Logprobs distribution probe** *(optional)* — top-1 next-token and
-  `|delta logprob|` comparison, the strongest non-attested signal when both
-  endpoints expose it.
-- **Input-side tokenizer diff** *(manual probe)* — fingerprint the tokenizer
-  from `usage.input_tokens` / `prompt_tokens` of prompt-only messages:
-  `tokens(T) - tokens("a")` per path cancels per-path overhead without a
-  third control route. Works when completions are capped/mutated. Measured
-  per-family the gateway deltas ship in
-  [`references/tokenizer-baselines-2026-10.md`](references/tokenizer-baselines-2026-10.md).
+- Sends five family-dividing texts plus the control "a" to
+  `{base}/chat/completions` (OpenAI dialect) or `{base}/messages` (Anthropic
+  dialect, tried on 404/405)
+- Reads `usage.input_tokens` or `usage.prompt_tokens`
+- Computes `delta(T) = tokens(T) - tokens("a")` per text, which cancels the
+  path's template and system-prompt overhead
+- Compares the five deltas against the measured reference signature of the
+  claimed family, per text, with tolerance
+  `max(2, ceil(0.08 * reference))`
+- Prints a verdict and a full JSON report. The key is never printed and
+  never written to the report
 
-## How it works
-
-```
-                 +-----------------------+
-                 |    verify_gateway.py  |
-                 |   Python 3 - stdlib   |
-                 +-----------+-----------+
-                             |
-             +---------------+----------------+
-             v                                v
-   +-------------------+            +-------------------+
-   |  suspect gateway  |            |  baseline (opt.)  |
-   |   the claimed id  |            |  official vendor  |
-   +---------+---------+            +---------+---------+
-             +---------------+----------------+
-                             v
-                 +-----------------------+
-                 |    evidence ledger    |
-                 | STRONG/MODERATE/WEAK  |
-                 |     FOR / AGAINST     |
-                 +-----------+-----------+
-                             v
-        CONTRADICTIONS - TENSIONS - SERVICE
-        DEGRADATION - CONSISTENT - INCONCLUSIVE
-```
+> [!IMPORTANT]
+> This method cannot prove authenticity. A match is WEAK evidence for the
+> counting dialect, never for the weights. See "Honest limits" below.
 
 ## Quick start
 
-Python 3, standard library only — no `pip install`, runs on Windows / macOS / Linux.
+Python 3, standard library only - no `pip install`, runs on Windows / macOS /
+Linux. Three inputs: base URL, API key, model id.
 
 ```bash
-# Install as a skill for Claude Code / OpenCode / any harness that reads skills
-git clone https://github.com/SNNN-011/model-authenticity-verifier \
-    ~/.claude/skills/model-authenticity-verifier
-
-# 0. Offline logic check: 75 assertions, no network
-python scripts/verify_gateway.py selftest
-
-# 1. Full probe, no baseline (finds contradictions, cannot prove identity)
 VERIFY_API_KEY=sk-... python scripts/verify_gateway.py \
     --base https://gw.example.com/v1 \
-    --model "vendor/model-id"
-```
-
-```bash
-# 2. Differential vs the official endpoint (the strongest available check)
-python scripts/verify_gateway.py \
-    --base https://gw.example.com/v1 --model "vendor/model-id" \
-    --baseline-base https://api.official.example/v1 --baseline-model "official-id" \
-    --logprobs
-
-# 3. Reproduce a previous dynamic battery / needle exactly
-... --seed 42 --out report.json
+    --model "anthropic/claude-opus-4.8"
 ```
 
 On Windows use `python` instead of `python3`; set the key with
-`$env:VERIFY_API_KEY = "sk-..."`.
+`$env:VERIFY_API_KEY = "sk-..."`. Offline logic check (no network):
+`python scripts/verify_gateway.py selftest`.
 
-## Probe reference
+## Reference signatures
 
-| Flag | What it records |
-|---|---|
-| `--probes infra` | wrapper stack, headers, catalog fingerprint, token overhead |
-| `--probes service` | hidden output caps, response mutation, reasoning/logprobs passthrough |
-| `--probes caps` | seedable capability battery + dual-depth needle (`--needle-chars 120000`, `--skip-needle` to drop it) |
-| `--probes self` | identity / cutoff self-report, sampled twice |
-| `--baseline-base` + `--baseline-model` | differential testing (pass rates, exact-output agreement, forced-output tokenizer check) |
-| `--logprobs` | logprobs distribution comparison (requires baseline) |
-| `--seed N` | reproduce the exact battery + needle from a previous run |
-| `--out file.json` | full machine-readable report |
+Measured 2026-10-29 against the audited gateway, with a text set of the same
+composition as the built-ins (id+accuse, jv+price, code, cjk+emoji,
+arab+misc) whose exact strings live only on the audit machine. The
+collector's built-in texts are public stand-ins, so an exact match is
+indicative and a deviation has to be re-measured before it counts (R6).
+Measured signatures, anomalies and usage rules:
+[`references/tokenizer-baselines-2026-10.md`](references/tokenizer-baselines-2026-10.md).
 
-Default probe set is `infra,service,caps,self`. Keys come from `--key` /
-`--baseline-key`, or `VERIFY_API_KEY` / `VERIFY_BASELINE_API_KEY`. Keys are never
-printed or written to the report.
+| family key | models | signature (T1..T5) |
+|---|---|---|
+| `anthropic-core` | anthropic/claude-opus-4.7, claude-opus-4.8, claude-opus-5, claude-sonnet-5 | 45 40 35 45 47 |
+| `anthropic-4.6` | anthropic/claude-opus-4.6, anthropic/claude-sonnet-4.6 | 35 34 29 46 47 |
+| `openai` | openai/gpt-5.6-terra, openai/gpt-5.6-sol | 24 24 22 30 29 |
+| `deepseek` | deepseek/deepseek-v4-pro, deepseek/deepseek-v4.1-flash-1017 | 27 26 23 32 25 |
 
-## Models with a measured tokenizer baseline (the gateway, 2026-10-29)
+Model id to family matching: longest key first, case-insensitive substring
+match. `deepseek-v4-flash` has no usable reference (nondeterministic usage
+accounting) and maps to no family: `UNMEASURED FAMILY`.
 
-The input-side diff was measured against `the audited gateway` (11 of 32 models,
-partial run). A new audit can compare a gateway's deltas straight against
-these signatures (full method, anomalies, and usage rules: the
-[baseline file](references/tokenizer-baselines-2026-10.md)):
-
-| Claimed model → check against | Delta signature T1–T5 |
-|---|---|
-| `claude-opus-4.7` / `-4.8` / `-5`, `claude-sonnet-5` (Anthropic core) | `45 40 35 45 47` |
-| `claude-opus-4.6` / `claude-sonnet-4.6` (older-generation branch) | `35 34 29 46 47` |
-| `gpt-5.6-terra` / `gpt-5.6-sol` (OpenAI family) | `24 24 22 30 29` |
-| `deepseek-v4-pro`, `deepseek-v4.1-flash-1017` | `27 26 23 32 25` |
-| `deepseek-v4-flash` | anomalous - do not use as a reference until re-run |
-
-Not yet measured on the gateway: the 5.5-generation Claude models (opus/sonnet/haiku),
-gpt-6*, gemini, glm/zai, minimax, moonshot kimi, qwen, xiaomi, and the
-`uncensored/*` uncensored twin. Two fable models and `gpt-6-astra` were excluded
-by request. A signature match is WEAK evidence (usage is forgeable, rule R8) -
-score family agreement across texts, never a single text.
-
-## Evidence model (the ground rules)
-
-- **Self-report is one-directional.** Naming a *different* family is real evidence.
-  Naming the *right* family is not — one injected system prompt produces any identity.
-- **Usage numbers are testimony, not measurement.** `completion_tokens` is believed
-  only after a client-side cross-check against the raw text, and even then capped at WEAK.
-- **Identity and service findings never mix.** An output cap is a service finding;
-  a capped genuine model is still genuine.
-- **Dead is not fake.** Consistent timeouts are reported as unavailable, not as rejection.
-
-## Verdict semantics
+## Verdicts
 
 | Verdict | Meaning |
 |---|---|
-| `CONTRADICTIONS FOUND` | hard evidence against the label — do not trust it |
-| `IDENTITY TENSIONS FOUND` | mixed signals — investigate the listed items |
-| `SERVICE DEGRADATION DETECTED` | model may be genuine, but capped or mutated |
-| `CONSISTENT` | no contradictions found — **not** proof of authenticity |
-| `INCONCLUSIVE` | no evidence in either direction |
-| `ENDPOINT UNAVAILABLE` | dead, not fake |
+| `SIGNATURE MATCH` | 4 or 5 of 5 texts agree with the claimed family's reference signature. WEAK FOR: same tokenizer dialect, not proof of weights. |
+| `PARTIAL MATCH` | 2 or 3 of 5 agree. Mixed. Re-run with fresh texts before concluding anything. |
+| `SIGNATURE MISMATCH` | 0 or 1 of 5 agree. The tokenizer does not look like the claimed family's. |
+| `UNMEASURED FAMILY` | no reference signature for the claimed model. The deltas are reported raw so they can be baselined later. |
+| `UNSTABLE ACCOUNTING` | the control's token count moved between repeats (`--repeat` > 1). The route's usage accounting is not stable, so no conclusion is drawn. |
+| `ENDPOINT UNAVAILABLE` | the endpoint did not answer. Dead, not fake. |
+| `NO USAGE REPORTED` | responses carried no token usage, so the method could not run. |
 
-## What can and cannot be proven
+Decision order: endpoint unavailable > no usage reported > unstable
+accounting > family verdict. A text matches its reference when
+`abs(delta - reference) <= max(2, ceil(0.08 * reference))`.
 
-| Method | Strength | Requirement |
-|---|---|---|
-| Weight inspection / fingerprint embedding | Definitive | Owner cooperation or weights |
-| TEE attestation | Definitive | Provider runs attested hardware (rare) |
-| Differential vs official endpoint | Strong evidence | Official API key |
-| Logprobs distribution comparison | Strong evidence | Both endpoints expose logprobs |
-| Capability battery + long-context probes | Moderate | Working endpoint |
-| Tokenizer signature (forced output) | Weak (usage is forgeable) | Baseline for comparison |
-| Self-report identity / cutoff | Strong *only when contradictory* | Working endpoint |
+## The probe texts
 
-## Field notes
+Five family-dividing texts plus the control `a`. Plain repeated ASCII and
+long plain English agree across most families and prove nothing, which is why
+these are not in the set.
 
-Real sessions, raw numbers, including the disappointing parts:
+Control: `a`
 
-- **July 2026** — a NewAPI stack caught by the identity probe alone (model
-  confessed to being a different family); a native vendor endpoint passed.
-  → [`references/probe-sessions-july2026.md`](references/probe-sessions-july2026.md)
-- **October 2026** — a gateway selling a `deepseek/*` label whose route
-  self-identified as OpenAI across every sample; logprobs silently stripped on
-  both routes; a canonical-answer caveat on battery agreement; and the
-  identical-text tokenizer comparison as a WEAK fallback probe.
-  → [`references/probe-sessions-october2026.md`](references/probe-sessions-october2026.md)
+```
+T1 id+accuse:
+Dia menuduh saya mencuri charger laptop di ruang rapat, tetapi rekaman CCTV menunjukkan saya sedang memperbaiki proyektor.
+
+T2 jv+price:
+Regane dagangan ing pasar kutha iki pitung pitulas; regane jaran 25.50, lan ora ana barang liya kanggo dijual.
+
+T3 code:
+def fib(n): return n if n < 2 else fib(n-1) + fib(n-2)  # memoize with a dict cache
+
+T4 cjk+emoji:
+用户说这个功能在生产环境会失败，请先修复再发布，否则客户会流失。🚀🔥✅
+
+T5 arab+misc:
+هل يمكنك ترجمة هذا النص إلى الإنجليزية؟ also: ∑ 3+4=7, 100% ✓ ok?
+```
+
+## Honest limits
+
+- **Usage numbers are testimony, not measurement (R1).** A proxy can
+  re-tokenize locally and forge `usage`. A match gates the counting dialect,
+  never the weights.
+- **The built-in texts are stand-ins** for the measured 2026-10-29 set (R6).
+  An exact match is indicative, and a deviation has to be re-measured before
+  it counts.
+- **One text proves nothing (R3).** Family agreement is scored across texts;
+  known anomalies are `claude-sonnet-5` T5 = 184 (siblings 47) and
+  `claude-opus-4.7` T4 = 46 (siblings 45), both single-text one-offs inside
+  agreeing families.
+- **Unstable accounting invalidates a run (R5).** `deepseek-v4-flash` is the
+  known case: control "a" moved 22 -> 5 -> 31 across runs and max_tokens.
+  It maps to `UNMEASURED FAMILY`.
+- **Parameter-independent modifications degrade fingerprints** (wrappers,
+  system prompts, RAG; see `references/methodology.md`). A mismatch is a
+  reason to investigate, never a conviction.
+- **Nothing here proves authenticity.** That requires weights, an
+  owner-keyed fingerprint or attested hardware; none of those ship over a
+  bearer-key HTTP endpoint.
 
 ## Files
 
 ```
-SKILL.md                        agent-facing instructions, ground rules, workflow
-scripts/verify_gateway.py       the collector (stdlib only, selftest included)
-references/methodology.md       research basis, probe-to-paper mapping, rules R1-R8
-references/probe-sessions-*.md  real field logs with raw numbers
-docs/                           the one-page site (GitHub Pages, no build step)
+SKILL.md                              agent-facing instructions, ground rules, workflow
+scripts/verify_gateway.py             the collector (stdlib only, selftest included)
+references/methodology.md             the research behind the method, WEAK by construction
+references/tokenizer-baselines-2026-10.md   measured signatures, per-model deltas, usage rules
+references/field-notes-2026-10.md     raw numbers behind the baselines
+docs/                                 the one-page site (GitHub Pages, no build step)
 ```
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT - see [LICENSE](LICENSE).
