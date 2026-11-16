@@ -3,12 +3,12 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Model Authenticity Verifier — label vs. weights</title>
-<meta name="description" content="A black-box audit skill for third-party LLM gateways. Evidence for and against the claimed model identity, with an honest verdict when the evidence runs out.">
+<title>Model Authenticity Verifier — same tokens, same model?</title>
+<meta name="description" content="One method, three inputs: base URL, API key, model id. An input-side tokenizer diff, compared against measured family signatures. Weak evidence, honestly reported.">
 <meta name="color-scheme" content="light">
 <meta property="og:type" content="website">
 <meta property="og:title" content="Model Authenticity Verifier">
-<meta property="og:description" content="Is the model behind that gateway really what the label says? A black-box audit that collects evidence for and against the claim, and says when the question is still open.">
+<meta property="og:description" content="Does this gateway tokenize like the family its label claims? One input-side diff against measured signatures, deltas reported raw, verdicts stated plainly.">
 <meta property="og:url" content="https://snnn-011.github.io/model-authenticity-verifier/">
 <meta name="twitter:card" content="summary">
 <link rel="canonical" href="https://snnn-011.github.io/model-authenticity-verifier/">
@@ -34,12 +34,12 @@
     </header>
 
     <h1 id="hero-title" class="hero-title">
-      <span class="hero-line line-a">Label vs.</span>
-      <span class="hero-line line-b">weights</span>
+      <span class="hero-line line-a">Same tokens?</span>
+      <span class="hero-line line-b">same model?</span>
     </h1>
 
     <div class="hero-foot">
-      <p class="hero-say">Every gateway label is a claim. Black-box testing cannot see the weights, so this skill collects evidence for and against the claim, and says when the question is still open.</p>
+      <p class="hero-say">Every gateway label is a claim. This tool asks one question about the tokenizer: does this route count tokens like the family it claims to serve?</p>
       <a class="button" href="https://github.com/SNNN-011/model-authenticity-verifier#quick-start">Install the skill</a>
     </div>
   </section>
@@ -47,91 +47,123 @@
   <section class="rules" aria-labelledby="rules-title">
     <h2 id="rules-title" class="visually-hidden">Ground rules</h2>
     <div class="stair">
-      <p class="stair-line" style="--i:0">Self-report is one-way.</p>
-      <p class="stair-line" style="--i:1">Capability needs a baseline.</p>
+      <p class="stair-line" style="--i:0">One text proves nothing.</p>
+      <p class="stair-line" style="--i:1">Usage is testimony.</p>
       <p class="stair-line" style="--i:2">Dead is not fake.</p>
     </div>
-    <p class="rules-note reveal">Eight ground rules from the skill. A contradiction is evidence; agreement is never scored.</p>
+    <p class="rules-note reveal">Six ground rules in SKILL.md. The method answers one question, and hides the other five.</p>
   </section>
 
-  <section class="ledger" id="ledger" aria-labelledby="ledger-title">
+  <section class="matcher" id="matcher" aria-labelledby="matcher-title">
     <div class="section-head">
-      <h2 id="ledger-title" class="reveal">Weigh the evidence.</h2>
-      <p class="lede reveal">Six findings from the October 2026 session, abridged. Toggle them and the verdict updates with the rule the report uses. Service findings never move identity.</p>
+      <h2 id="matcher-title" class="reveal">Match the signature.</h2>
+      <p class="lede reveal">Type the deltas your route reported. The matcher scores them against the four measured family signatures, per text, within max(2, ceil(0.08 x reference)).</p>
     </div>
 
-    <div class="ledger-grid">
-      <form class="ledger-form" id="evidence-form" data-ui>
-        <table class="ledger-table">
-          <caption class="visually-hidden">Evidence ledger demo. Each finding has a strength and a direction.</caption>
+    <div class="matcher-grid">
+      <form class="matcher-form" id="signature-form" data-ui>
+        <table class="sig-table">
+          <caption class="visually-hidden">Reference tokenizer signatures, deltas for texts T1 to T5. A text matches a family when its delta is within max(2, ceil(0.08 of the reference)) of the reference.</caption>
           <thead>
             <tr>
-              <th scope="col">Finding</th>
-              <th scope="col">Tag</th>
+              <th scope="col">Family</th>
+              <th scope="col">Signature</th>
+              <th scope="col">Match</th>
+              <th scope="col"><span class="visually-hidden">Load</span></th>
             </tr>
           </thead>
           <tbody>
-            <tr class="group-row"><th colspan="2" scope="colgroup">Identity evidence</th></tr>
             <tr>
-              <td><label class="finding"><input type="checkbox" data-kind="identity" data-dir="against" data-weight="strong" data-short="self-report"><span>Five or more samples name OpenAI under a <code>deepseek/*</code> label</span></label></td>
-              <td><span class="tag tag-against">Strong against</span></td>
+              <td data-label="Family">anthropic-core</td>
+              <td data-label="Signature"><span class="sig-nums">45 40 35 45 47</span><br><span class="sig-models">claude-opus-4.7, claude-opus-4.8, claude-opus-5, claude-sonnet-5</span></td>
+              <td data-label="Match"><span class="sig-match" data-family="anthropic-core">&mdash;</span></td>
+              <td data-label="Load"><button type="button" class="load-btn" data-load="45,40,35,45,47" aria-label="Load the anthropic-core signature 45 40 35 45 47 into the inputs">Load</button></td>
             </tr>
             <tr>
-              <td><label class="finding"><input type="checkbox" data-kind="identity" data-dir="against" data-weight="moderate" data-short="cutoff"><span>The cutoff answer changes between identical requests</span></label></td>
-              <td><span class="tag tag-against">Moderate against</span></td>
+              <td data-label="Family">anthropic-4.6</td>
+              <td data-label="Signature"><span class="sig-nums">35 34 29 46 47</span><br><span class="sig-models">claude-opus-4.6, claude-sonnet-4.6</span></td>
+              <td data-label="Match"><span class="sig-match" data-family="anthropic-4.6">&mdash;</span></td>
+              <td data-label="Load"><button type="button" class="load-btn" data-load="35,34,29,46,47" aria-label="Load the anthropic-4.6 signature 35 34 29 46 47 into the inputs">Load</button></td>
             </tr>
             <tr>
-              <td><label class="finding"><input type="checkbox" data-kind="identity" data-dir="for" data-weight="moderate" data-short="battery" checked><span>Battery 8/8 and the 120,000-character needle pass</span></label></td>
-              <td><span class="tag tag-for">Moderate for</span></td>
-            </tr>
-            <tr class="group-row"><th colspan="2" scope="colgroup">Service findings</th></tr>
-            <tr>
-              <td><label class="finding"><input type="checkbox" data-kind="service" data-dir="against" data-weight="strong" data-short="logprobs" checked><span>Logprobs stripped on both routes</span></label></td>
-              <td><span class="tag tag-service">Service</span></td>
+              <td data-label="Family">openai</td>
+              <td data-label="Signature"><span class="sig-nums">24 24 22 30 29</span><br><span class="sig-models">gpt-5.6-terra, gpt-5.6-sol</span></td>
+              <td data-label="Match"><span class="sig-match" data-family="openai">&mdash;</span></td>
+              <td data-label="Load"><button type="button" class="load-btn" data-load="24,24,22,30,29" aria-label="Load the openai signature 24 24 22 30 29 into the inputs">Load</button></td>
             </tr>
             <tr>
-              <td><label class="finding"><input type="checkbox" data-kind="service" data-dir="against" data-weight="moderate" data-short="budget" checked><span><code>max_tokens</code> 5 or 10 returns 502, reasoning budget exhausted</span></label></td>
-              <td><span class="tag tag-service">Service</span></td>
+              <td data-label="Family">deepseek</td>
+              <td data-label="Signature"><span class="sig-nums">27 26 23 32 25</span><br><span class="sig-models">deepseek-v4-pro, deepseek-v4.1-flash-1017</span></td>
+              <td data-label="Match"><span class="sig-match" data-family="deepseek">&mdash;</span></td>
+              <td data-label="Load"><button type="button" class="load-btn" data-load="27,26,23,32,25" aria-label="Load the deepseek signature 27 26 23 32 25 into the inputs">Load</button></td>
+            </tr>
+            <tr class="sig-excluded">
+              <td data-label="Family">deepseek-v4-flash</td>
+              <td data-label="Signature">no usable reference<br><span class="sig-models">nondeterministic usage accounting; excluded from matching</span></td>
+              <td data-label="Match">excluded</td>
+              <td data-label="Load"><span class="load-none">No reference</span></td>
             </tr>
           </tbody>
         </table>
+
+        <fieldset class="delta-field">
+          <legend class="delta-legend">Your five deltas, tokens(T) - tokens("a")</legend>
+          <div class="delta-grid">
+            <div class="delta-cell">
+              <label for="d1">T1</label>
+              <input type="number" id="d1" name="d1" inputmode="numeric" min="0" max="10000" step="1" placeholder="0">
+              <span class="delta-name">id+accuse</span>
+            </div>
+            <div class="delta-cell">
+              <label for="d2">T2</label>
+              <input type="number" id="d2" name="d2" inputmode="numeric" min="0" max="10000" step="1" placeholder="0">
+              <span class="delta-name">jv+price</span>
+            </div>
+            <div class="delta-cell">
+              <label for="d3">T3</label>
+              <input type="number" id="d3" name="d3" inputmode="numeric" min="0" max="10000" step="1" placeholder="0">
+              <span class="delta-name">code</span>
+            </div>
+            <div class="delta-cell">
+              <label for="d4">T4</label>
+              <input type="number" id="d4" name="d4" inputmode="numeric" min="0" max="10000" step="1" placeholder="0">
+              <span class="delta-name">cjk+emoji</span>
+            </div>
+            <div class="delta-cell">
+              <label for="d5">T5</label>
+              <input type="number" id="d5" name="d5" inputmode="numeric" min="0" max="10000" step="1" placeholder="0">
+              <span class="delta-name">arab+misc</span>
+            </div>
+          </div>
+        </fieldset>
+
+        <p class="delta-rule">Tolerance per text: max(2, ceil(0.08 x reference)). A text matches a family when its delta falls within tolerance. Verdict from the best family: 4 or 5 of 5 is SIGNATURE MATCH, 2 or 3 is PARTIAL MATCH, 0 or 1 is SIGNATURE MISMATCH.</p>
       </form>
 
-      <aside class="verdict" data-ui aria-labelledby="verdict-word" aria-live="polite" aria-atomic="true">
-        <p class="verdict-word" id="verdict-word">Service degradation detected</p>
-        <p class="verdict-say" id="verdict-say">The model may be genuine, but it is capped or mutated.</p>
-        <p class="verdict-count" id="verdict-count">Identity: 1 for, 0 against. Service: 2 against.</p>
-        <p class="verdict-driver" id="verdict-driver">Decided by: logprobs, reasoning budget.</p>
+      <aside class="verdict" data-ui aria-labelledby="matcher-word" aria-live="polite" aria-atomic="true">
+        <p class="verdict-word" id="matcher-word">Type five deltas.</p>
+        <p class="verdict-say" id="matcher-say">The matcher scores each family as soon as all five inputs carry a number.</p>
+        <p class="verdict-count" id="matcher-count">Matches per family appear here.</p>
+        <p class="verdict-driver" id="matcher-driver">Tolerance: max(2, ceil(0.08 x reference)). Weak evidence: same dialect, not the same weights.</p>
       </aside>
     </div>
 
-    <p class="fineprint reveal">Black-box testing cannot prove authenticity. Consistent means no contradiction was found, not that the model is genuine.</p>
-    <noscript><p class="fineprint">The live verdict needs JavaScript. The table above shows the default selection.</p></noscript>
+    <p class="fineprint reveal">Usage numbers are testimony, not measurement. A signature match gates the counting dialect; it never proves the weights. Re-run with fresh texts before concluding anything.</p>
+    <noscript><p class="fineprint">The live matcher needs JavaScript. The table above carries the same data: the tolerance rule and the four signatures are all you need to score by hand.</p></noscript>
   </section>
 
   <section class="method" id="method" aria-labelledby="method-title">
     <h2 id="method-title" class="reveal">How a run goes</h2>
 
-    <div class="bar reveal" data-ui role="img" aria-label="Probe stages by duration: price check 30 seconds, wrapper and service audit 2 to 3 minutes, capability battery 3 to 5 minutes, self-report 1 minute.">
-      <div class="seg seg-a" style="--grow:1.5">
-        <span class="seg-time">30 seconds</span>
-        <span class="seg-what">Price check. Opus at $0.001/M is a story, not a model.</span>
-      </div>
-      <div class="seg seg-b" style="--grow:2.5">
-        <span class="seg-time">2 to 3 minutes</span>
-        <span class="seg-what">Wrapper and service audit: fields, headers, token overhead, hidden caps.</span>
-      </div>
-      <div class="seg seg-c" style="--grow:4">
-        <span class="seg-time">3 to 5 minutes</span>
-        <span class="seg-what">Seedable battery plus a 120,000-character needle at two depths.</span>
-      </div>
-      <div class="seg seg-d" style="--grow:1.5">
-        <span class="seg-time">1 minute</span>
-        <span class="seg-what">Identity and cutoff, sampled twice. Only a contradiction counts.</span>
-      </div>
-    </div>
+    <ol class="steps">
+      <li class="reveal"><strong>Control.</strong> One prompt-only request carrying the single character "a".</li>
+      <li class="reveal"><strong>Probe set.</strong> Five prompt-only requests: mixed-script prose, Javanese with a price, a code one-liner, Chinese with emoji, Arabic with symbols.</li>
+      <li class="reveal"><strong>Subtract.</strong> delta(T) = tokens(T) - tokens("a"), so the path's template and system-prompt overhead cancels out.</li>
+      <li class="reveal"><strong>Compare.</strong> Each delta against the measured signature of the claimed model's family.</li>
+      <li class="reveal"><strong>Read.</strong> Four or five of five texts agree, and you have a signature match. Weak evidence, but evidence.</li>
+    </ol>
 
-    <p class="bar-note reveal">The fifth step needs the official key: the same prompts against the vendor endpoint, compared at temperature 0. It is the strongest check a user can run, and it still cannot prove weights.</p>
+    <p class="method-note reveal">Provenance: the reference signatures were measured on 2026-10-29 on a text set of the same composition (id+accuse, jv+price, code, cjk+emoji, arab+misc); the exact strings live only on the audit machine. The collector's built-in texts are public stand-ins with the same composition, so an exact match is indicative, and a deviation has to be re-measured before it counts.</p>
 
     <h3 id="strength-title" class="reveal">What a signal is worth</h3>
     <table class="strength" aria-labelledby="strength-title">
@@ -141,11 +173,7 @@
       <tbody>
         <tr><td data-label="Signal">Inspected weights, embedded fingerprint</td><td data-label="Weight">Definitive</td><td data-label="Needs">Owner cooperation or weight access</td></tr>
         <tr><td data-label="Signal">TEE attestation</td><td data-label="Weight">Definitive</td><td data-label="Needs">Provider runs attested hardware</td></tr>
-        <tr><td data-label="Signal">Differential against the official endpoint</td><td data-label="Weight">Strong</td><td data-label="Needs">Official API key</td></tr>
-        <tr><td data-label="Signal">Logprobs distribution</td><td data-label="Weight">Strong</td><td data-label="Needs">Both endpoints expose logprobs</td></tr>
-        <tr><td data-label="Signal">Capability battery, long context</td><td data-label="Weight">Moderate</td><td data-label="Needs">Working endpoint</td></tr>
-        <tr><td data-label="Signal">Tokenizer signature</td><td data-label="Weight">Weak</td><td data-label="Needs">A baseline, cross-checked</td></tr>
-        <tr><td data-label="Signal">Self-report identity, cutoff</td><td data-label="Weight">Strong only when contradictory</td><td data-label="Needs">Working endpoint</td></tr>
+        <tr><td data-label="Signal">Tokenizer signature, measured family</td><td data-label="Weight">Weak</td><td data-label="Needs">Working endpoint, same path for control and probes</td></tr>
       </tbody>
     </table>
   </section>
@@ -153,77 +181,80 @@
   <section class="probes" id="probes" aria-labelledby="probes-title">
     <div class="probe-col">
       <h2 id="probes-title" class="reveal">Probe reference</h2>
-      <p class="probe-intro reveal">One flag selects each family. The default set is infra, service, caps, self.</p>
+      <p class="probe-intro reveal">One command, three required inputs. Flags only tune the run.</p>
 
-      <p class="probe-group reveal">Infrastructure and service</p>
+      <p class="probe-group reveal">The three inputs</p>
       <ul class="probe-list">
-        <li class="reveal"><code>--probes infra</code><span>wrapper fields, x-headers, catalog, token overhead</span></li>
-        <li class="reveal"><code>--probes service</code><span>hidden caps, response mutation, reasoning passthrough</span></li>
-        <li class="reveal"><code>--probes caps</code><span>seedable battery, dual-depth needle at 25% and 75%</span></li>
-        <li class="reveal"><code>--probes self</code><span>identity and cutoff, sampled twice</span></li>
+        <li class="reveal"><code>--base</code><span>gateway root, e.g. https://gw.example.com/v1</span></li>
+        <li class="reveal"><code>--model</code><span>the model id the gateway claims to serve</span></li>
+        <li class="reveal"><code>--key</code><span>or env VERIFY_API_KEY; never printed, never written to the report</span></li>
       </ul>
 
-      <p class="probe-group reveal">Differential</p>
+      <p class="probe-group reveal">Repeats</p>
       <ul class="probe-list">
-        <li class="reveal"><code>--baseline-base</code><span>same prompts against the official endpoint, temperature 0</span></li>
-        <li class="reveal"><code>--logprobs</code><span>top-1 next token, delta logprob, needs both routes</span></li>
+        <li class="reveal"><code>--repeat N</code><span>repeat the probe set, catches unstable usage accounting</span></li>
       </ul>
 
-      <p class="probe-group reveal">Reports</p>
+      <p class="probe-group reveal">Report</p>
       <ul class="probe-list">
-        <li class="reveal"><code>--seed N</code><span>reproduce the battery and needle exactly</span></li>
-        <li class="reveal"><code>--out file.json</code><span>full machine-readable report, keys never written</span></li>
+        <li class="reveal"><code>--out FILE</code><span>full JSON report, keys never written</span></li>
+      </ul>
+
+      <p class="probe-group reveal">Pacing</p>
+      <ul class="probe-list">
+        <li class="reveal"><code>--sleep S</code><span>seconds between requests, default 2</span></li>
+        <li class="reveal"><code>--timeout S</code><span>per-request timeout, default 60</span></li>
+      </ul>
+
+      <p class="probe-group reveal">Offline</p>
+      <ul class="probe-list">
+        <li class="reveal"><code>selftest</code><span>offline check, no key, no network</span></li>
       </ul>
     </div>
 
     <figure class="terminal reveal" data-ui>
       <pre><code><span class="t-prompt">$</span> python scripts/verify_gateway.py selftest
-SELFTEST (v2.2): 75 passed, 0 failed
+SELFTEST (v3.0): 54 passed, 0 failed
 
 <span class="t-prompt">$</span> VERIFY_API_KEY=sk-... python scripts/verify_gateway.py \
     --base https://gw.example.com/v1 --model "vendor/model-id"
 <span class="caret" aria-hidden="true"></span></code></pre>
-      <figcaption>The offline check runs without a key or a network. 75 assertions, Python standard library only.</figcaption>
+      <figcaption>The offline check runs without a key or a network. 54 assertions, Python standard library only.</figcaption>
     </figure>
   </section>
 
   <section class="signatures" id="signatures" aria-labelledby="signatures-title">
     <div class="shelf-head">
       <h2 id="signatures-title" class="reveal">Measured tokenizer signatures</h2>
-      <p class="shelf-note reveal">Input-side delta for texts T1 to T5, measured on the audited gateway, 2026-10-29. A match is weak evidence: usage is forgeable. Family agreement across several texts is the only useful reading.</p>
+      <p class="shelf-note reveal">Measured 2026-10-29 on the audited gateway, 11 of 32 models. Deltas are tokens(T) - tokens("a") on the same path.</p>
     </div>
 
-    <ul class="shelf reveal" data-ui aria-label="Models with a measured tokenizer baseline">
-      <li class="spine fam-anthropic"><a href="https://github.com/SNNN-011/model-authenticity-verifier/blob/main/references/tokenizer-baselines-2026-10.md"><span class="spine-name">claude-opus-4.7</span><span class="spine-delta">45 40 35 45 47</span></a></li>
-      <li class="spine fam-anthropic"><a href="https://github.com/SNNN-011/model-authenticity-verifier/blob/main/references/tokenizer-baselines-2026-10.md"><span class="spine-name">claude-opus-4.8</span><span class="spine-delta">45 40 35 45 47</span></a></li>
-      <li class="spine fam-anthropic"><a href="https://github.com/SNNN-011/model-authenticity-verifier/blob/main/references/tokenizer-baselines-2026-10.md"><span class="spine-name">claude-opus-5</span><span class="spine-delta">45 40 35 45 47</span></a></li>
-      <li class="spine fam-anthropic"><a href="https://github.com/SNNN-011/model-authenticity-verifier/blob/main/references/tokenizer-baselines-2026-10.md"><span class="spine-name">claude-sonnet-5</span><span class="spine-delta">45 40 35 45 47</span></a></li>
-      <li class="spine fam-anthropic"><a href="https://github.com/SNNN-011/model-authenticity-verifier/blob/main/references/tokenizer-baselines-2026-10.md"><span class="spine-name">claude-opus-4.6</span><span class="spine-delta">35 34 29 46 47</span></a></li>
-      <li class="spine fam-anthropic"><a href="https://github.com/SNNN-011/model-authenticity-verifier/blob/main/references/tokenizer-baselines-2026-10.md"><span class="spine-name">claude-sonnet-4.6</span><span class="spine-delta">35 34 29 46 47</span></a></li>
-      <li class="spine fam-openai"><a href="https://github.com/SNNN-011/model-authenticity-verifier/blob/main/references/tokenizer-baselines-2026-10.md"><span class="spine-name">gpt-5.6-terra</span><span class="spine-delta">24 24 22 30 29</span></a></li>
-      <li class="spine fam-openai"><a href="https://github.com/SNNN-011/model-authenticity-verifier/blob/main/references/tokenizer-baselines-2026-10.md"><span class="spine-name">gpt-5.6-sol</span><span class="spine-delta">24 24 22 30 29</span></a></li>
-      <li class="spine fam-deepseek"><a href="https://github.com/SNNN-011/model-authenticity-verifier/blob/main/references/tokenizer-baselines-2026-10.md"><span class="spine-name">deepseek-v4-pro</span><span class="spine-delta">27 26 23 32 25</span></a></li>
-      <li class="spine fam-deepseek"><a href="https://github.com/SNNN-011/model-authenticity-verifier/blob/main/references/tokenizer-baselines-2026-10.md"><span class="spine-name">deepseek-v4.1-flash-1017</span><span class="spine-delta">27 26 23 32 25</span></a></li>
-      <li class="spine fam-deepseek"><a href="https://github.com/SNNN-011/model-authenticity-verifier/blob/main/references/tokenizer-baselines-2026-10.md"><span class="spine-name">deepseek-v4-flash</span><span class="spine-delta spine-anomaly">anomalous, do not use</span></a></li>
+    <ul class="shelf reveal" data-ui aria-label="Family signatures measured on the audited gateway">
+      <li class="spine fam-anthropic"><a href="https://github.com/SNNN-011/model-authenticity-verifier/blob/main/references/tokenizer-baselines-2026-10.md"><span class="spine-name">anthropic-core</span><span class="spine-delta">45 40 35 45 47</span></a></li>
+      <li class="spine fam-anthropic"><a href="https://github.com/SNNN-011/model-authenticity-verifier/blob/main/references/tokenizer-baselines-2026-10.md"><span class="spine-name">anthropic-4.6</span><span class="spine-delta">35 34 29 46 47</span></a></li>
+      <li class="spine fam-openai"><a href="https://github.com/SNNN-011/model-authenticity-verifier/blob/main/references/tokenizer-baselines-2026-10.md"><span class="spine-name">openai</span><span class="spine-delta">24 24 22 30 29</span></a></li>
+      <li class="spine fam-deepseek"><a href="https://github.com/SNNN-011/model-authenticity-verifier/blob/main/references/tokenizer-baselines-2026-10.md"><span class="spine-name">deepseek</span><span class="spine-delta">27 26 23 32 25</span></a></li>
+      <li class="spine fam-excluded"><a href="https://github.com/SNNN-011/model-authenticity-verifier/blob/main/references/tokenizer-baselines-2026-10.md"><span class="spine-name">deepseek-v4-flash</span><span class="spine-delta spine-anomaly">no usable reference</span></a></li>
     </ul>
 
-    <p class="shelf-legend reveal">Sand spines: Anthropic. Slate: OpenAI. Pale: DeepSeek. The anomalous run is marked on its spine. 11 of 32 models were measured; the rest are still open.</p>
+    <p class="shelf-legend reveal">Sand spines: Anthropic families. anthropic-core covers claude-opus-4.7, claude-opus-4.8, claude-opus-5, claude-sonnet-5; anthropic-4.6 covers claude-opus-4.6 and claude-sonnet-4.6. Slate: openai, gpt-5.6-terra and gpt-5.6-sol. Pale: deepseek, deepseek-v4-pro and deepseek-v4.1-flash-1017. The marked spine is excluded from matching: deepseek-v4-flash showed nondeterministic usage accounting, so no usable reference exists. 11 of 32 models were measured; the rest are still open.</p>
   </section>
 
   <section class="verdicts" aria-labelledby="verdicts-title">
-    <h2 id="verdicts-title" class="reveal">Six verdicts.</h2>
+    <h2 id="verdicts-title" class="reveal">Seven verdicts.</h2>
     <dl class="verdict-list">
-      <div class="verdict-row reveal"><dt>Contradictions found</dt><dd>Hard evidence against the label. Do not trust it.</dd></div>
-      <div class="verdict-row reveal"><dt>Identity tensions found</dt><dd>Mixed signals. Investigate the listed items.</dd></div>
-      <div class="verdict-row reveal"><dt>Service degradation detected</dt><dd>The model may be genuine, but it is capped or mutated.</dd></div>
-      <div class="verdict-row reveal"><dt>Consistent</dt><dd>No contradiction found. Not proof of authenticity.</dd></div>
-      <div class="verdict-row reveal"><dt>Inconclusive</dt><dd>No evidence in either direction.</dd></div>
-      <div class="verdict-row reveal"><dt>Endpoint unavailable</dt><dd>Dead, not fake. Report it as dead.</dd></div>
+      <div class="verdict-row reveal"><dt>Signature match</dt><dd>Four or five of five texts agree with the claimed family's signature. Weak evidence: same dialect, not the same weights.</dd></div>
+      <div class="verdict-row reveal"><dt>Partial match</dt><dd>Two or three agree. Re-run with fresh texts before concluding.</dd></div>
+      <div class="verdict-row reveal"><dt>Signature mismatch</dt><dd>Zero or one agrees. The tokenizer does not look like that family.</dd></div>
+      <div class="verdict-row reveal"><dt>Unmeasured family</dt><dd>No reference for the claimed model. The deltas are reported raw.</dd></div>
+      <div class="verdict-row reveal"><dt>Unstable accounting</dt><dd>The control count moved between repeats. Nothing can be concluded.</dd></div>
+      <div class="verdict-row reveal"><dt>Endpoint unavailable</dt><dd>Dead, not fake.</dd></div>
+      <div class="verdict-row reveal"><dt>No usage reported</dt><dd>The gateway returned no token usage, so the method could not run.</dd></div>
     </dl>
   </section>
 
   <a class="cta" href="https://github.com/SNNN-011/model-authenticity-verifier">
-    <span class="cta-note">Python 3, standard library only. Clone it, point it at a gateway, read the ledger.</span>
+    <span class="cta-note">Python 3, standard library only. One method, three inputs: base URL, key, model.</span>
     <svg class="cta-arrow" width="48" height="48" viewBox="0 0 48 48" aria-hidden="true" focusable="false"><path d="M11 37 37 11M15 11h22v22" fill="none" stroke="currentColor" stroke-width="2.5"/></svg>
     <span class="cta-word">Verify</span>
   </a>
@@ -240,27 +271,26 @@ SELFTEST (v2.2): 75 passed, 0 failed
       </ul>
     </div>
     <div class="foot-col">
-      <p>Reference</p>
+      <p>Method</p>
       <ul>
         <li><a href="https://github.com/SNNN-011/model-authenticity-verifier/blob/main/SKILL.md">Skill instructions</a></li>
         <li><a href="https://github.com/SNNN-011/model-authenticity-verifier/blob/main/references/methodology.md">Methodology</a></li>
-        <li><a href="https://github.com/SNNN-011/model-authenticity-verifier/blob/main/references/probe-sessions-october2026.md">Field notes</a></li>
+        <li><a href="https://github.com/SNNN-011/model-authenticity-verifier/blob/main/references/field-notes-2026-10.md">Field notes</a></li>
       </ul>
     </div>
     <div class="foot-col">
-      <p>Evidence</p>
+      <p>Data</p>
       <ul>
         <li><a href="https://github.com/SNNN-011/model-authenticity-verifier/blob/main/references/tokenizer-baselines-2026-10.md">Tokenizer baselines</a></li>
-        <li><a href="https://github.com/SNNN-011/model-authenticity-verifier/blob/main/references/probe-sessions-july2026.md">July 2026</a></li>
-        <li><a href="https://github.com/SNNN-011/model-authenticity-verifier/blob/main/references/probe-sessions-october2026.md">October 2026</a></li>
+        <li><a href="https://github.com/SNNN-011/model-authenticity-verifier/blob/main/references/field-notes-2026-10.md">Field notes</a></li>
       </ul>
     </div>
     <div class="foot-col">
       <p>Collection</p>
       <ul>
         <li><a href="https://github.com/affaan-m/ECC">Everything Claude Code</a></li>
-        <li><span>v2.2, October 2026</span></li>
-        <li><span>Selftest: 75 assertions</span></li>
+        <li><span>v3.0, November 2026</span></li>
+        <li><span>Selftest: 54 assertions</span></li>
       </ul>
     </div>
   </div>

@@ -25,69 +25,98 @@
     targets.forEach(function (el) { io.observe(el); });
   }
 
-  // The evidence ledger: identity findings decide identity, service findings never do.
-  var form = document.getElementById('evidence-form');
-  var panel = document.querySelector('.verdict');
+  // The signature matcher: score the visitor's five deltas against the measured families.
+  var form = document.getElementById('signature-form');
+  var panel = document.querySelector('.matcher .verdict');
   if (!form || !panel) return;
 
-  var boxes = Array.prototype.slice.call(form.querySelectorAll('input[type="checkbox"]'));
-  var word = document.getElementById('verdict-word');
-  var say = document.getElementById('verdict-say');
-  var count = document.getElementById('verdict-count');
-  var driver = document.getElementById('verdict-driver');
+  var families = [
+    { key: 'anthropic-core', signature: [45, 40, 35, 45, 47] },
+    { key: 'anthropic-4.6', signature: [35, 34, 29, 46, 47] },
+    { key: 'openai', signature: [24, 24, 22, 30, 29] },
+    { key: 'deepseek', signature: [27, 26, 23, 32, 25] }
+  ];
 
-  var labels = {
-    'self-report': 'self-report',
-    'cutoff': 'cutoff drift',
-    'battery': 'battery',
-    'logprobs': 'logprobs',
-    'budget': 'reasoning budget'
-  };
+  var inputs = [1, 2, 3, 4, 5].map(function (n) {
+    return document.getElementById('d' + n);
+  });
 
-  var verdicts = {
-    contradictions: ['Contradictions found', 'Hard evidence against the label. Do not trust it.'],
-    tensions: ['Identity tensions found', 'Mixed signals. Investigate the listed items.'],
-    service: ['Service degradation detected', 'The model may be genuine, but it is capped or mutated.'],
-    consistent: ['Consistent', 'No contradiction found. Not proof of authenticity.'],
-    inconclusive: ['Inconclusive', 'No evidence in either direction.']
-  };
+  var word = document.getElementById('matcher-word');
+  var say = document.getElementById('matcher-say');
+  var count = document.getElementById('matcher-count');
+  var driver = document.getElementById('matcher-driver');
+  var matchCells = Array.prototype.slice.call(document.querySelectorAll('.sig-match'));
+
+  function tolerance(reference) {
+    return Math.max(2, Math.ceil(0.08 * reference));
+  }
+
+  function score(deltas, signature) {
+    var matched = 0;
+    var deviation = 0;
+    for (var i = 0; i < 5; i++) {
+      var diff = Math.abs(deltas[i] - signature[i]);
+      deviation += diff;
+      if (diff <= tolerance(signature[i])) matched += 1;
+    }
+    return { matched: matched, deviation: deviation };
+  }
 
   function render() {
-    var picked = boxes.filter(function (box) { return box.checked; }).map(function (box) {
-      return {
-        kind: box.getAttribute('data-kind'),
-        dir: box.getAttribute('data-dir'),
-        weight: box.getAttribute('data-weight'),
-        short: box.getAttribute('data-short')
-      };
-    });
+    var raw = inputs.map(function (input) { return input.value.trim(); });
+    var filled = raw.filter(function (value) { return value !== ''; }).length;
 
-    var against = picked.filter(function (item) { return item.kind === 'identity' && item.dir === 'against'; });
-    var support = picked.filter(function (item) { return item.kind === 'identity' && item.dir === 'for'; });
-    var service = picked.filter(function (item) { return item.kind === 'service'; });
-
-    var key = 'inconclusive';
-    var drivers = [];
-    if (against.length) {
-      key = against.some(function (item) { return item.weight === 'strong'; }) ? 'contradictions' : 'tensions';
-      drivers = (key === 'contradictions')
-        ? against.filter(function (item) { return item.weight === 'strong'; })
-        : against;
-    } else if (service.length) {
-      key = 'service';
-      drivers = service;
-    } else if (support.length) {
-      key = 'consistent';
-      drivers = support;
+    if (filled < 5) {
+      word.textContent = filled === 0 ? 'Type five deltas.' : 'Keep typing.';
+      say.textContent = filled + ' of 5 deltas in. The matcher scores as soon as all five inputs carry a number.';
+      count.textContent = 'Matches per family appear here.';
+      driver.textContent = 'Tolerance: max(2, ceil(0.08 x reference)). Weak evidence: same dialect, not the same weights.';
+      matchCells.forEach(function (cell) { cell.textContent = '—'; });
+      return;
     }
 
-    word.textContent = verdicts[key][0];
-    say.textContent = verdicts[key][1];
-    count.textContent = 'Identity: ' + support.length + ' for, ' + against.length +
-      ' against. Service: ' + service.length + ' against.';
-    driver.textContent = drivers.length
-      ? 'Decided by: ' + drivers.map(function (item) { return labels[item.short]; }).join(', ') + '.'
-      : 'Nothing selected yet.';
+    var deltas = raw.map(function (value) { return Number(value); });
+    if (deltas.some(function (value) { return !isFinite(value) || value < 0; })) {
+      word.textContent = 'Numbers only.';
+      say.textContent = 'Each delta is a non-negative whole token count, tokens(T) - tokens("a").';
+      count.textContent = 'Matches per family appear here.';
+      driver.textContent = 'Tolerance: max(2, ceil(0.08 x reference)).';
+      return;
+    }
+
+    var results = families.map(function (family) {
+      return { key: family.key, result: score(deltas, family.signature) };
+    });
+
+    matchCells.forEach(function (cell) {
+      var entry = results.filter(function (item) { return item.key === cell.getAttribute('data-family'); })[0];
+      if (entry) cell.textContent = entry.result.matched + ' of 5';
+    });
+
+    var best = results.slice().sort(function (a, b) {
+      if (b.result.matched !== a.result.matched) return b.result.matched - a.result.matched;
+      return a.result.deviation - b.result.deviation;
+    })[0];
+
+    var verdict;
+    var meaning;
+    if (best.result.matched >= 4) {
+      verdict = 'SIGNATURE MATCH';
+      meaning = 'Four or five of five texts agree. Same counting dialect as ' + best.key + ', not proof of the same weights.';
+    } else if (best.result.matched >= 2) {
+      verdict = 'PARTIAL MATCH';
+      meaning = 'Two or three of five agree with ' + best.key + '. Mixed. Re-run with fresh texts before concluding anything.';
+    } else {
+      verdict = 'SIGNATURE MISMATCH';
+      meaning = 'Zero or one of five agrees with any measured family. The tokenizer does not look like the claimed family’s.';
+    }
+
+    word.textContent = verdict;
+    say.textContent = meaning;
+    count.textContent = results.map(function (item) {
+      return item.key + ' ' + item.result.matched + '/5';
+    }).join(' · ');
+    driver.textContent = 'Best family: ' + best.key + ' (' + best.result.matched + ' of 5, deviation ' + best.result.deviation + '). Tolerance: max(2, ceil(0.08 x reference)).';
 
     panel.classList.remove('is-new');
     void panel.offsetWidth;
@@ -95,6 +124,19 @@
   }
 
   form.addEventListener('submit', function (event) { event.preventDefault(); });
-  boxes.forEach(function (box) { box.addEventListener('change', render); });
+  inputs.forEach(function (input) {
+    input.addEventListener('input', render);
+    input.addEventListener('change', render);
+  });
+
+  Array.prototype.forEach.call(document.querySelectorAll('.load-btn'), function (button) {
+    button.addEventListener('click', function () {
+      var values = (button.getAttribute('data-load') || '').split(',');
+      inputs.forEach(function (input, i) { input.value = values[i] || ''; });
+      render();
+      inputs[0].focus();
+    });
+  });
+
   render();
 })();
