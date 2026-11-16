@@ -14,33 +14,37 @@ from datetime import datetime
 VERSION = "3.0"
 TOOL = "model-authenticity-verifier"
 CONTROL_TEXT = "a"
+USER_AGENT = "model-authenticity-verifier/3.0"
+# Reasoning routes burn the budget and answer 502; prompt_tokens does not depend on max_tokens.
+MAX_TOKENS_LADDER = [64, 512, 2048]
+RETRYABLE_HTTP = (429, 500, 502, 503, 504)
 
-# Probe texts (spec R6: built-in texts are public stand-ins matching the 2026-10-29 set
-# by composition only; an exact match is indicative, not proof).
+# Probe texts: the public text set the reference signatures were measured with
+# (control "a" plus five family-dividing texts). The exact strings matter: the
+# signatures below only compare against deltas taken from these texts.
 PROBES = [
-    ("T1 id+accuse", "Dia menuduh saya mencuri charger laptop di ruang rapat, tetapi rekaman CCTV menunjukkan saya sedang memperbaiki proyektor."),
-    ("T2 jv+price", "Regane dagangan ing pasar kutha iki pitung pitulas; regane jaran 25.50, lan ora ana barang liya kanggo dijual."),
-    ("T3 code", "def fib(n): return n if n < 2 else fib(n-1) + fib(n-2)  # memoize with a dict cache"),
-    ("T4 cjk+emoji", "用户说这个功能在生产环境会失败，请先修复再发布，否则客户会流失。🚀🔥✅"),
-    ("T5 arab+misc", "هل يمكنك ترجمة هذا النص إلى الإنجليزية؟ also: ∑ 3+4=7, 100% ✓ ok?"),
+    ("T1 id+emoji", "Aku menuduh kau berbohong tentang model ini \U0001F521"),
+    ("T2 jv+price", "Aku tuku sega pecel Rp17.500 ing pasar, rasane enak tenan"),
+    ("T3 js_code", "const total = items.reduce((a, b) => a + b.price, 0);"),
+    ("T4 cjk+emoji+math", "\u6df7\u5408\u4e2d\u6587\u3001\u65e5\u672c\u8a9e\u3068emoji \U0001F30C\U0001F680 \u3068\u8a08\u7b97: 17\u00d723=391\u3001128\u00f74=32"),
+    ("T5 arab+misc", "\u0645\u0631\u062d\u0628\u0627 \u0628\u0627\u0644\u0639\u0627\u0644\u0645 \u0661\u0662\u0663 \u03a9\u22483.14 \u2211(x_i) \u2014 na\u00efve caf\u00e9"),
 ]
 
-# Reference signatures: 5 deltas (T1..T5), measured 2026-10-29.
+# Reference signatures: 5 deltas (T1..T5).
+# Only the deepseek family was measured with the probe texts above, so it is the
+# only signature this collector can judge. The other families are known as
+# families, but their numbers come from the 2026-10-29 scan, whose texts were
+# never published, so they stay out of the comparison (R6).
 REFERENCE = {
-    "anthropic-core": [45, 40, 35, 45, 47],
-    "anthropic-4.6": [35, 34, 29, 46, 47],
-    "openai": [24, 24, 22, 30, 29],
-    "deepseek": [27, 26, 23, 32, 25],
+    "deepseek": [14, 20, 18, 27, 22],
 }
 
-# Keys from the models column of the table, longest first, case-insensitive substring
-# match on the model id. Bare final segments are included so prefixed and unprefixed
 # ids both resolve. `deepseek-v4-flash` matches none of these on purpose.
 _MODEL_KEYS = {
     "anthropic-core": ["anthropic/claude-opus-4.7", "claude-opus-4.8", "claude-opus-5", "anthropic/claude-sonnet-5"],
     "anthropic-4.6": ["anthropic/claude-opus-4.6", "anthropic/claude-sonnet-4.6"],
     "openai": ["openai/gpt-5.6-terra", "openai/gpt-5.6-sol"],
-    "deepseek": ["deepseek/deepseek-v4-pro", "deepseek/deepseek-v4.1-flash-1017"],
+    "deepseek": ["deepseek/deepseek-v4-pro", "deepseek/deepseek-v4.1-flash-1017", "deepseek-v4.1-flash"],
 }
 
 def _family_keys():
@@ -88,21 +92,28 @@ def parse_usage_tokens(body):
     return None
 
 def family_verdict(matches):
-    if matches >= 4:
+    # 5 of 5 is the only clean family agreement. A single text that misses is an
+    # anomaly, not a family split (R3), so 4 of 5 stays undecided and 3 or fewer
+    # is a disagreement.
+    if matches >= 5:
         return "SIGNATURE MATCH"
-    if matches >= 2:
+    if matches == 4:
         return "PARTIAL MATCH"
     return "SIGNATURE MISMATCH"
 
 def is_unstable(control_counts):
     return len(set(control_counts)) > 1
 
-# Decision order: endpoint unavailable > no usage reported > unstable accounting > family verdict.
-def decide(endpoint_failed=False, usage_missing=False, unstable=False, family=None, matches=None):
+# Decision order: endpoint unavailable > no usage reported > probe incomplete >
+# unstable accounting > family verdict.
+def decide(endpoint_failed=False, usage_missing=False, incomplete=False,
+           unstable=False, family=None, matches=None):
     if endpoint_failed:
         return "ENDPOINT UNAVAILABLE"
     if usage_missing:
         return "NO USAGE REPORTED"
+    if incomplete:
+        return "PROBE INCOMPLETE"
     if unstable:
         return "UNSTABLE ACCOUNTING"
     if family is None:
@@ -136,45 +147,60 @@ def post_json(url, payload, key, timeout):
             "Authorization": "Bearer " + key,
             "x-api-key": key,
             "anthropic-version": "2023-06-01",
+            "User-Agent": USER_AGENT,
         },
         method="POST",
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return resp.status, json.loads(resp.read().decode("utf-8", errors="replace"))
 
-def probe_once(base, model, key, text, dialect_holder, timeout):
-    """Send one prompt-only request. dialect_holder is [dialect] mutated on 404/405 fallback."""
-    body = {"model": model, "messages": [{"role": "user", "content": text}],
-            "max_tokens": 1, "stream": False}
-    dialect = dialect_holder[0]
+def probe_once(base, model, key, text, dialect_holder, timeout, attempts=3):
+    """One prompt-only request, with a max_tokens ladder and retries.
 
-    def _attempt(path, dialect_name):
-        url = base.rstrip("/") + path
-        status, resp_body = post_json(url, body, key, timeout)
-        return dialect_name, resp_body
-
-    try:
-        if dialect == "openai":
-            return _attempt("/chat/completions", "openai")
-        return _attempt("/messages", "anthropic")
-    except urllib.error.HTTPError as e:
-        if dialect == "openai" and e.code in (404, 405):
-            dialect_holder[0] = "anthropic"
+    A reasoning route burns its budget and answers 502, so the ladder climbs
+    instead of failing; prompt_tokens does not change with max_tokens. A
+    transient drop is retried, because one dropped connection is not a dead
+    route (R4). A 404/405 on the OpenAI dialect switches the run to the
+    Anthropic dialect.
+    """
+    last = "endpoint did not answer"
+    switched = False
+    for rung, max_tokens in enumerate(MAX_TOKENS_LADDER):
+        path = "/chat/completions" if dialect_holder[0] == "openai" else "/messages"
+        body = {"model": model, "messages": [{"role": "user", "content": text}],
+                "max_tokens": max_tokens, "stream": False}
+        for attempt in range(attempts):
             try:
-                return _attempt("/messages", "anthropic")
-            except urllib.error.HTTPError as e2:
-                raise ProbeFailure("endpoint returned HTTP %d" % e2.code)
-            except (urllib.error.URLError, TimeoutError, OSError, ValueError):
-                raise ProbeFailure("endpoint did not answer on /messages")
-        raise ProbeFailure("endpoint returned HTTP %d" % e.code)
-    except (urllib.error.URLError, TimeoutError, OSError, ValueError):
-        raise ProbeFailure("endpoint did not answer")
+                _, resp_body = post_json(base.rstrip("/") + path, body, key, timeout)
+                return resp_body
+            except urllib.error.HTTPError as e:
+                code = e.code
+                if code in (404, 405) and dialect_holder[0] == "openai" and not switched:
+                    dialect_holder[0] = "anthropic"
+                    switched = True
+                    break
+                last = "endpoint returned HTTP %d" % code
+                if code in RETRYABLE_HTTP:
+                    if code == 502 and rung + 1 < len(MAX_TOKENS_LADDER):
+                        break
+                    time.sleep(1.5 * (attempt + 1))
+                    continue
+                raise ProbeFailure(last)
+            except (urllib.error.URLError, TimeoutError, OSError, ValueError) as e:
+                last = "endpoint did not answer (%s)" % type(e).__name__
+                time.sleep(1.5 * (attempt + 1))
+                continue
+        if switched:
+            break
+    if switched:
+        return probe_once(base, model, key, text, dialect_holder, timeout, attempts)
+    raise ProbeFailure(last)
 
 class ProbeFailure(Exception):
     pass
 
 def build_report(base, model, dialect, control_tokens_list, probe_results, family,
-                 signature, matches, verdict, note):
+                 signature, matches, verdict, note, failed_probes=None):
     report = {
         "tool": TOOL,
         "version": VERSION,
@@ -188,6 +214,7 @@ def build_report(base, model, dialect, control_tokens_list, probe_results, famil
         "matches": matches,
         "verdict": verdict,
         "note": note,
+        "failed_probes": list(failed_probes or []),
     }
     return report
 
@@ -230,11 +257,12 @@ def run(args):
     probe_bodies = []  # raw tokens per probe for report (first repeat only)
     endpoint_error = None
     usage_missing = False
+    failed_probes = []
 
     for rep in range(args.repeat):
         # control first, then probes, same path, same body shape
         try:
-            _, ctrl_body = probe_once(args.base, args.model, key, CONTROL_TEXT, dialect_holder, args.timeout)
+            ctrl_body = probe_once(args.base, args.model, key, CONTROL_TEXT, dialect_holder, args.timeout)
         except ProbeFailure as e:
             endpoint_error = str(e)
             break
@@ -248,14 +276,14 @@ def run(args):
         sleep_between(args.sleep)
         for i, (name, text) in enumerate(texts):
             try:
-                _, body = probe_once(args.base, args.model, key, text, dialect_holder, args.timeout)
+                body = probe_once(args.base, args.model, key, text, dialect_holder, args.timeout)
             except ProbeFailure as e:
-                endpoint_error = str(e)
-                break
+                failed_probes.append("%s (%s)" % (name, e))
+                continue
             tok = parse_usage_tokens(body)
             if tok is None:
-                usage_missing = True
-                break
+                failed_probes.append("%s (no token usage in the response)" % name)
+                continue
             if rep == 0:
                 probe_bodies.append((name, text, tok))
             if i < len(texts) - 1 or rep < args.repeat - 1:
@@ -275,7 +303,7 @@ def run(args):
             delta = compute_delta(tok, ctrl)
             ref = signature[idx] if signature and idx < len(signature) else None
             # unstable accounting: deltas reported raw, no match scoring at all (R5)
-            m = (text_matches(delta, ref) if ref is not None and not unstable else None)
+            m = (text_matches(delta, ref) if ref is not None and not unstable and not failed_probes else None)
             if m:
                 matched += 1
             probe_results.append({
@@ -286,14 +314,18 @@ def run(args):
                 "match": m,
                 "chars": len(text),
             })
-        matches = (matched if signature and not unstable else None)
+        matches = (matched if signature and not unstable and not failed_probes else None)
 
     if endpoint_error:
         verdict = decide(endpoint_failed=True)
-        note = "%s; the route is dead, not fake (R4)" % endpoint_error
+        note = "%s; no usable answer, which is not evidence about the model (R4)" % endpoint_error
     elif usage_missing:
         verdict = decide(usage_missing=True)
         note = "responses carried no token usage; the method could not run"
+    elif failed_probes:
+        verdict = decide(incomplete=True)
+        note = "the route answered but %d of %d texts could not be measured (%s); the deltas below are partial, re-run (R4)" % (
+            len(failed_probes), len(texts), "; ".join(failed_probes))
     elif unstable:
         verdict = decide(unstable=True)
         note = "control token count moved across repeats (%s); usage accounting is not stable, no conclusion drawn (R5)" % (
@@ -304,13 +336,16 @@ def run(args):
     elif family is None:
         verdict = decide(family=None)
         note = "no reference signature for the claimed model; deltas reported raw so they can be baselined later"
+    elif signature is None:
+        verdict = decide(family=None)
+        note = "the %s family is known, but no signature was measured with these texts; deltas reported raw (R6)" % family
     else:
         verdict = decide(family=family, matches=matches)
         note = verdict_note(verdict, matches)
 
     report = build_report(args.base, args.model, dialect, control_tokens_all,
-                          probe_results, family if signature else None, signature,
-                          matches, verdict, note)
+                          probe_results, family, signature,
+                          matches, verdict, note, failed_probes)
 
     print("base: %s" % args.base)
     print("model: %s" % args.model)
@@ -326,6 +361,8 @@ def run(args):
                 p["name"], p["tokens"], p["delta"], p["reference"], match_s, p["chars"]))
     if matches is not None:
         print("matches: %d/5" % matches)
+    for f in failed_probes:
+        print("not measured: %s" % f)
     print("verdict: %s" % verdict)
     print("note: %s" % note)
 
@@ -343,7 +380,7 @@ def verdict_note(verdict, matches):
     if verdict == "SIGNATURE MATCH":
         return "%d/5 texts agree with the claimed family; WEAK evidence for tokenizer dialect only, never weights (R1)" % matches
     if verdict == "PARTIAL MATCH":
-        return "%d/5 texts agree; mixed signal, re-run with fresh texts before concluding anything" % matches
+        return "%d/5 texts agree; one text that misses is an anomaly, not a family split, re-run with fresh texts (R3)" % matches
     return "%d/5 texts agree; the tokenizer does not look like the claimed family's" % matches
 
 def sleep_between(seconds):
@@ -417,9 +454,9 @@ def selftest():
 
     # --- verdict selection (groups E+F+G, 12) ---
     check("verdict 5/5 signature match", lambda: family_verdict(5) == "SIGNATURE MATCH")
-    check("verdict 4/5 signature match", lambda: family_verdict(4) == "SIGNATURE MATCH")
-    check("verdict 3/5 partial", lambda: family_verdict(3) == "PARTIAL MATCH")
-    check("verdict 2/5 partial", lambda: family_verdict(2) == "PARTIAL MATCH")
+    check("verdict 4/5 is undecided", lambda: family_verdict(4) == "PARTIAL MATCH")
+    check("verdict 3/5 mismatch", lambda: family_verdict(3) == "SIGNATURE MISMATCH")
+    check("verdict 2/5 mismatch", lambda: family_verdict(2) == "SIGNATURE MISMATCH")
     check("verdict 1/5 mismatch", lambda: family_verdict(1) == "SIGNATURE MISMATCH")
     check("verdict 0/5 mismatch", lambda: family_verdict(0) == "SIGNATURE MISMATCH")
     check("moved control is unstable", lambda: is_unstable([5, 5, 7]))
@@ -428,6 +465,15 @@ def selftest():
     check("decision: no usage beats unstable", lambda: decide(usage_missing=True, unstable=True, family="openai", matches=5) == "NO USAGE REPORTED")
     check("decision: unstable beats family verdict", lambda: decide(unstable=True, family="openai", matches=5) == "UNSTABLE ACCOUNTING")
     check("decision: unmeasured family when no family", lambda: decide(family=None) == "UNMEASURED FAMILY")
+
+    # --- ladder, retries and the partial-run verdict (group I, 7) ---
+    check("ladder starts at 64", lambda: MAX_TOKENS_LADDER[0] == 64)
+    check("ladder ends at 2048", lambda: MAX_TOKENS_LADDER[-1] == 2048)
+    check("ladder climbs", lambda: MAX_TOKENS_LADDER == sorted(MAX_TOKENS_LADDER))
+    check("502 is retryable", lambda: 502 in RETRYABLE_HTTP)
+    check("402 is not retryable", lambda: 402 not in RETRYABLE_HTTP)
+    check("decision: incomplete beats unstable", lambda: decide(incomplete=True, unstable=True, family="openai", matches=5) == "PROBE INCOMPLETE")
+    check("decision: endpoint beats incomplete", lambda: decide(endpoint_failed=True, incomplete=True) == "ENDPOINT UNAVAILABLE")
 
     # --- report safety & shape (group H, 2) ---
     sentinel = "sk-sentinel-never-in-report"
@@ -441,15 +487,15 @@ def selftest():
     failed = [d for d, ok in results if not ok]
     passed = total - len(failed)
 
-    if total != 54:
-        print("SELFTEST (v3.0): internal error, expected 54 assertions, ran %d" % total, file=sys.stderr)
+    if total != 61:
+        print("SELFTEST (v3.0): internal error, expected 61 assertions, ran %d" % total, file=sys.stderr)
         return 2
     if failed:
         for d in failed:
             print("FAIL: %s" % d, file=sys.stderr)
         print("SELFTEST (v3.0): %d passed, %d failed" % (passed, len(failed)))
         return 2
-    print("SELFTEST (v3.0): 54 passed, 0 failed")
+    print("SELFTEST (v3.0): 61 passed, 0 failed")
     return 0
 
 def main():

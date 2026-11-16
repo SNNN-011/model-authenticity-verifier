@@ -84,16 +84,17 @@ R6. **The text set is part of the measurement.** The reference signatures
 
 | Verdict | Meaning |
 |---|---|
-| `SIGNATURE MATCH` | 4 or 5 of 5 texts agree with the claimed family's reference signature. WEAK FOR: same tokenizer dialect, not proof of weights. |
-| `PARTIAL MATCH` | 2 or 3 of 5 agree. Mixed. Re-run with fresh texts before concluding anything. |
-| `SIGNATURE MISMATCH` | 0 or 1 of 5 agree. The tokenizer does not look like the claimed family's. |
+| `SIGNATURE MATCH` | 5 of 5 texts agree with the claimed family's reference signature. WEAK FOR: same tokenizer dialect, not proof of weights. |
+| `PARTIAL MATCH` | 4 of 5 agree. One text that misses is an anomaly, not a family split (R3): re-run with fresh texts before concluding anything. |
+| `SIGNATURE MISMATCH` | 3 or fewer agree. The tokenizer does not look like the claimed family's. |
 | `UNMEASURED FAMILY` | no reference signature for the claimed model. The deltas are reported raw so they can be baselined later. |
 | `UNSTABLE ACCOUNTING` | the control's token count moved between repeats (only checked with `--repeat` > 1). The route's usage accounting is not stable, so no conclusion is drawn. |
-| `ENDPOINT UNAVAILABLE` | the endpoint did not answer. Dead, not fake. |
+| `PROBE INCOMPLETE` | the route answered but some texts could not be measured. The deltas are partial, so no family verdict is drawn. Re-run. |
+| `ENDPOINT UNAVAILABLE` | the endpoint did not answer usefully: timeout, refusal or an HTTP error. The note carries the status. Dead is not fake, and neither is a refusal. |
 | `NO USAGE REPORTED` | responses carried no token usage, so the method could not run. |
 
-Decision order: endpoint unavailable > no usage reported > unstable
-accounting > family verdict.
+Decision order: endpoint unavailable > no usage reported > probe incomplete >
+unstable accounting > family verdict.
 
 A text matches its reference when
 `abs(delta - reference) <= max(2, ceil(0.08 * reference))`.
@@ -109,16 +110,19 @@ A text matches its reference when
 
 ## Reference Signatures
 
-Family signature = 5 deltas in the order T1..T5. Measured 2026-10-29 against
-the audited gateway with the 2026-10-29 text set (same composition as the
-built-ins, different bytes; see R6).
+Family signature = 5 deltas in the order T1..T5. The collector ships one text
+set (control `a` plus T1 id+emoji, T2 jv+price, T3 js_code, T4 cjk+emoji+math,
+T5 arab+misc). The `deepseek` row was measured with exactly those texts on
+2026-11-16, so it is the only row this collector can judge. The other rows
+come from the 2026-10-29 scan, whose text set was never published: reference
+only, not comparable with the collector's deltas (R6).
 
-| family key | models | signature |
-|---|---|---|
-| `anthropic-core` | anthropic/claude-opus-4.7, claude-opus-4.8, claude-opus-5, claude-sonnet-5 | 45 40 35 45 47 |
-| `anthropic-4.6` | anthropic/claude-opus-4.6, anthropic/claude-sonnet-4.6 | 35 34 29 46 47 |
-| `openai` | openai/gpt-5.6-terra, openai/gpt-5.6-sol | 24 24 22 30 29 |
-| `deepseek` | deepseek/deepseek-v4-pro, deepseek/deepseek-v4.1-flash-1017 | 27 26 23 32 25 |
+| family key | models | signature | text set |
+|---|---|---|---|
+| `deepseek` | deepseek/deepseek-v4-pro, deepseek/deepseek-v4.1-flash-1017, deepseek-v4.1-flash | 14 20 18 27 22 | collector's, 2026-11-16 |
+| `anthropic-core` | anthropic/claude-opus-4.7, claude-opus-4.8, claude-opus-5, claude-sonnet-5 | 45 40 35 45 47 | 2026-10-29, reference only |
+| `anthropic-4.6` | anthropic/claude-opus-4.6, anthropic/claude-sonnet-4.6 | 35 34 29 46 47 | 2026-10-29, reference only |
+| `openai` | openai/gpt-5.6-terra, openai/gpt-5.6-sol | 24 24 22 30 29 | 2026-10-29, reference only |
 
 Model id to family matching: longest key first, case-insensitive substring
 match on the model id. `deepseek-v4-flash` has no usable reference
@@ -144,4 +148,5 @@ and maps to no family: `UNMEASURED FAMILY`.
 - `scripts/verify_gateway.py` - the collector (stdlib only, has selftest)
 - `references/methodology.md` - the research basis, WEAK by construction
 - `references/tokenizer-baselines-2026-10.md` - measured signatures, usage rules
-- `references/field-notes-2026-10.md` - raw numbers behind the baselines
+- `references/field-notes-2026-10.md` - raw numbers behind the 2026-10-29 baselines
+- `references/field-notes-2026-11.md` - the 2026-11-16 run on the collector's own texts

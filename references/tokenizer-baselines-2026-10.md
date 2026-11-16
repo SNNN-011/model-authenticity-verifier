@@ -1,5 +1,27 @@
 # the gateway tokenizer delta baselines (partial - 11 of 32 models)
 
+## Read this first: two text sets live in this file
+
+The table below was measured on 2026-10-29 with a text set that was never
+published. The collector (`scripts/verify_gateway.py`) ships a different,
+public text set: control `a` plus T1 id+emoji, T2 jv+price, T3 js_code, T4
+cjk+emoji+math, T5 arab+misc. A delta taken from one set cannot be compared
+with a signature measured on the other.
+
+The **live** signature for the collector is the deepseek one, measured with
+the collector's own texts on 2026-11-16:
+
+```
+deepseek: 14 20 18 27 22   (control 5 / 31 depending on the route)
+```
+
+with the per-route measurements in
+[`field-notes-2026-11.md`](field-notes-2026-11.md). The other three families
+below have no signature on this text set yet, so the collector reports
+`UNMEASURED FAMILY` for them instead of guessing.
+
+Everything under "Per-model deltas" is the 2026-10-29 record: reference only.
+
 Measured 2026-10-29 against `the audited gateway` with the input-side
 diff probe (control "a", 5 family-dividing texts, Anthropic dialect
 `/v1/messages`, stream off; on 502 a `max_tokens` ladder 16->256->2048).
@@ -70,9 +92,10 @@ delta(T) = input_tokens(T) - input_tokens("a"), per path, stream off.
 Compare a route's five deltas against the claimed family's signature. A text
 matches when `abs(delta - reference) <= max(2, ceil(0.08 * reference))`.
 
-- Match on 4+/5 texts within tolerance: `SIGNATURE MATCH` (WEAK FOR, R1).
-- Match on 2-3/5 texts: `PARTIAL MATCH`. Re-run with fresh texts before
-  concluding anything.
+- Match on 5/5 texts within tolerance: `SIGNATURE MATCH` (WEAK FOR, R1).
+- Match on 4/5 texts: `PARTIAL MATCH`. One text that misses is an anomaly, not
+  a family split: re-run with fresh texts before concluding anything.
+- Match on 3/5 or fewer: `SIGNATURE MISMATCH`.
 - Match on 0-1/5 texts: `SIGNATURE MISMATCH`.
 - No reference for the claimed family: `UNMEASURED FAMILY`; the deltas are
   reported raw so they can be baselined later.

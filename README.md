@@ -68,20 +68,24 @@ On Windows use `python` instead of `python3`; set the key with
 
 ## Reference signatures
 
-Measured 2026-10-29 against the audited gateway, with a text set of the same
-composition as the built-ins (id+accuse, jv+price, code, cjk+emoji,
-arab+misc) whose exact strings live only on the audit machine. The
-collector's built-in texts are public stand-ins, so an exact match is
-indicative and a deviation has to be re-measured before it counts (R6).
-Measured signatures, anomalies and usage rules:
-[`references/tokenizer-baselines-2026-10.md`](references/tokenizer-baselines-2026-10.md).
+Two text sets are in play, and a delta is only comparable within its own set.
 
-| family key | models | signature (T1..T5) |
-|---|---|---|
-| `anthropic-core` | anthropic/claude-opus-4.7, claude-opus-4.8, claude-opus-5, claude-sonnet-5 | 45 40 35 45 47 |
-| `anthropic-4.6` | anthropic/claude-opus-4.6, anthropic/claude-sonnet-4.6 | 35 34 29 46 47 |
-| `openai` | openai/gpt-5.6-terra, openai/gpt-5.6-sol | 24 24 22 30 29 |
-| `deepseek` | deepseek/deepseek-v4-pro, deepseek/deepseek-v4.1-flash-1017 | 27 26 23 32 25 |
+The **collector ships one set**: control `a` plus T1 id+emoji, T2 jv+price,
+T3 js_code, T4 cjk+emoji+math, T5 arab+misc. The `deepseek` signature below
+was measured with exactly those texts on 2026-11-16, so it is the only row
+this collector can judge.
+
+The other three rows come from the 2026-10-29 scan, whose text set was never
+published. They are reference only: a delta taken from the collector's texts
+cannot be compared with them (R6). Measured signatures, anomalies and usage
+rules: [`references/tokenizer-baselines-2026-10.md`](references/tokenizer-baselines-2026-10.md).
+
+| family key | models | signature (T1..T5) | text set |
+|---|---|---|---|
+| `deepseek` | deepseek/deepseek-v4-pro, deepseek/deepseek-v4.1-flash-1017, deepseek-v4.1-flash | 14 20 18 27 22 | collector's, 2026-11-16 |
+| `anthropic-core` | anthropic/claude-opus-4.7, claude-opus-4.8, claude-opus-5, claude-sonnet-5 | 45 40 35 45 47 | 2026-10-29, reference only |
+| `anthropic-4.6` | anthropic/claude-opus-4.6, anthropic/claude-sonnet-4.6 | 35 34 29 46 47 | 2026-10-29, reference only |
+| `openai` | openai/gpt-5.6-terra, openai/gpt-5.6-sol | 24 24 22 30 29 | 2026-10-29, reference only |
 
 Model id to family matching: longest key first, case-insensitive substring
 match. `deepseek-v4-flash` has no usable reference (nondeterministic usage
@@ -91,16 +95,17 @@ accounting) and maps to no family: `UNMEASURED FAMILY`.
 
 | Verdict | Meaning |
 |---|---|
-| `SIGNATURE MATCH` | 4 or 5 of 5 texts agree with the claimed family's reference signature. WEAK FOR: same tokenizer dialect, not proof of weights. |
-| `PARTIAL MATCH` | 2 or 3 of 5 agree. Mixed. Re-run with fresh texts before concluding anything. |
-| `SIGNATURE MISMATCH` | 0 or 1 of 5 agree. The tokenizer does not look like the claimed family's. |
+| `SIGNATURE MATCH` | 5 of 5 texts agree with the claimed family's reference signature. WEAK FOR: same tokenizer dialect, not proof of weights. |
+| `PARTIAL MATCH` | 4 of 5 agree. One text that misses is an anomaly, not a family split: re-run with fresh texts before concluding anything. |
+| `SIGNATURE MISMATCH` | 3 or fewer agree. The tokenizer does not look like the claimed family's. |
 | `UNMEASURED FAMILY` | no reference signature for the claimed model. The deltas are reported raw so they can be baselined later. |
 | `UNSTABLE ACCOUNTING` | the control's token count moved between repeats (`--repeat` > 1). The route's usage accounting is not stable, so no conclusion is drawn. |
-| `ENDPOINT UNAVAILABLE` | the endpoint did not answer. Dead, not fake. |
+| `PROBE INCOMPLETE` | the route answered but some texts could not be measured. The deltas are partial, so no family verdict is drawn. Re-run. |
+| `ENDPOINT UNAVAILABLE` | the endpoint did not answer usefully: timeout, refusal or an HTTP error. The note carries the status. Dead is not fake, and neither is a refusal. |
 | `NO USAGE REPORTED` | responses carried no token usage, so the method could not run. |
 
-Decision order: endpoint unavailable > no usage reported > unstable
-accounting > family verdict. A text matches its reference when
+Decision order: endpoint unavailable > no usage reported > probe incomplete >
+unstable accounting > family verdict. A text matches its reference when
 `abs(delta - reference) <= max(2, ceil(0.08 * reference))`.
 
 ## The probe texts
@@ -112,20 +117,20 @@ these are not in the set.
 Control: `a`
 
 ```
-T1 id+accuse:
-Dia menuduh saya mencuri charger laptop di ruang rapat, tetapi rekaman CCTV menunjukkan saya sedang memperbaiki proyektor.
+T1 id+emoji:
+Aku menuduh kau berbohong tentang model ini 🔡
 
 T2 jv+price:
-Regane dagangan ing pasar kutha iki pitung pitulas; regane jaran 25.50, lan ora ana barang liya kanggo dijual.
+Aku tuku sega pecel Rp17.500 ing pasar, rasane enak tenan
 
-T3 code:
-def fib(n): return n if n < 2 else fib(n-1) + fib(n-2)  # memoize with a dict cache
+T3 js_code:
+const total = items.reduce((a, b) => a + b.price, 0);
 
-T4 cjk+emoji:
-用户说这个功能在生产环境会失败，请先修复再发布，否则客户会流失。🚀🔥✅
+T4 cjk+emoji+math:
+混合中文、日本語とemoji 🌍🚀 と計算: 17×23=391、128÷4=32
 
 T5 arab+misc:
-هل يمكنك ترجمة هذا النص إلى الإنجليزية؟ also: ∑ 3+4=7, 100% ✓ ok?
+مرحبا بالعالم ١٢٣ Ω×3.14 ∑(x_i) — naïve café
 ```
 
 ## Honest limits
@@ -133,13 +138,15 @@ T5 arab+misc:
 - **Usage numbers are testimony, not measurement (R1).** A proxy can
   re-tokenize locally and forge `usage`. A match gates the counting dialect,
   never the weights.
-- **The built-in texts are stand-ins** for the measured 2026-10-29 set (R6).
-  An exact match is indicative, and a deviation has to be re-measured before
-  it counts.
-- **One text proves nothing (R3).** Family agreement is scored across texts;
-  known anomalies are `claude-sonnet-5` T5 = 184 (siblings 47) and
-  `claude-opus-4.7` T4 = 46 (siblings 45), both single-text one-offs inside
-  agreeing families.
+- **Only the deepseek signature is comparable.** It was measured with the
+  collector's own texts on 2026-11-16. The other three families come from the
+  2026-10-29 scan, whose texts were never published, so they are reference
+  only (R6).
+- **One text proves nothing (R3).** Family agreement is scored across texts:
+  5 of 5 is the only clean agreement, 4 of 5 is undecided, 3 or fewer is a
+  disagreement. A single text that misses is an anomaly, not a family split:
+  `claude-sonnet-5` T5 = 184 (siblings 47) and `claude-opus-4.7` T4 = 46
+  (siblings 45) are the known cases.
 - **Unstable accounting invalidates a run (R5).** `deepseek-v4-flash` is the
   known case: control "a" moved 22 -> 5 -> 31 across runs and max_tokens.
   It maps to `UNMEASURED FAMILY`.
@@ -157,7 +164,8 @@ SKILL.md                              agent-facing instructions, ground rules, w
 scripts/verify_gateway.py             the collector (stdlib only, selftest included)
 references/methodology.md             the research behind the method, WEAK by construction
 references/tokenizer-baselines-2026-10.md   measured signatures, per-model deltas, usage rules
-references/field-notes-2026-10.md     raw numbers behind the baselines
+references/field-notes-2026-10.md     raw numbers behind the 2026-10-29 baselines
+references/field-notes-2026-11.md     the 2026-11-16 run on the collector's own texts
 docs/                                 the one-page site (GitHub Pages, no build step)
 ```
 

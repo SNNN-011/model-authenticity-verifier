@@ -57,7 +57,7 @@
   <section class="matcher" id="matcher" aria-labelledby="matcher-title">
     <div class="section-head">
       <h2 id="matcher-title" class="reveal">Match the signature.</h2>
-      <p class="lede reveal">Type the deltas your route reported. The matcher scores them against the four measured family signatures, per text, within max(2, ceil(0.08 x reference)).</p>
+      <p class="lede reveal">Type the deltas your route reported. The matcher scores them against the deepseek signature, the only family measured with these texts.</p>
     </div>
 
     <div class="matcher-grid">
@@ -77,25 +77,25 @@
               <td data-label="Family">anthropic-core</td>
               <td data-label="Signature"><span class="sig-nums">45 40 35 45 47</span><br><span class="sig-models">claude-opus-4.7, claude-opus-4.8, claude-opus-5, claude-sonnet-5</span></td>
               <td data-label="Match"><span class="sig-match" data-family="anthropic-core">&mdash;</span></td>
-              <td data-label="Load"><button type="button" class="load-btn" data-load="45,40,35,45,47" aria-label="Load the anthropic-core signature 45 40 35 45 47 into the inputs">Load</button></td>
+              <td data-label="Load"><span class="load-none">Other text set</span></td>
             </tr>
             <tr>
               <td data-label="Family">anthropic-4.6</td>
               <td data-label="Signature"><span class="sig-nums">35 34 29 46 47</span><br><span class="sig-models">claude-opus-4.6, claude-sonnet-4.6</span></td>
               <td data-label="Match"><span class="sig-match" data-family="anthropic-4.6">&mdash;</span></td>
-              <td data-label="Load"><button type="button" class="load-btn" data-load="35,34,29,46,47" aria-label="Load the anthropic-4.6 signature 35 34 29 46 47 into the inputs">Load</button></td>
+              <td data-label="Load"><span class="load-none">Other text set</span></td>
             </tr>
             <tr>
               <td data-label="Family">openai</td>
               <td data-label="Signature"><span class="sig-nums">24 24 22 30 29</span><br><span class="sig-models">gpt-5.6-terra, gpt-5.6-sol</span></td>
               <td data-label="Match"><span class="sig-match" data-family="openai">&mdash;</span></td>
-              <td data-label="Load"><button type="button" class="load-btn" data-load="24,24,22,30,29" aria-label="Load the openai signature 24 24 22 30 29 into the inputs">Load</button></td>
+              <td data-label="Load"><span class="load-none">Other text set</span></td>
             </tr>
             <tr>
               <td data-label="Family">deepseek</td>
-              <td data-label="Signature"><span class="sig-nums">27 26 23 32 25</span><br><span class="sig-models">deepseek-v4-pro, deepseek-v4.1-flash-1017</span></td>
+              <td data-label="Signature"><span class="sig-nums">14 20 18 27 22</span><br><span class="sig-models">deepseek-v4-pro, deepseek-v4.1-flash-1017</span></td>
               <td data-label="Match"><span class="sig-match" data-family="deepseek">&mdash;</span></td>
-              <td data-label="Load"><button type="button" class="load-btn" data-load="27,26,23,32,25" aria-label="Load the deepseek signature 27 26 23 32 25 into the inputs">Load</button></td>
+              <td data-label="Load"><button type="button" class="load-btn" data-load="14,20,18,27,22" aria-label="Load the deepseek signature 14 20 18 27 22 into the inputs">Load</button></td>
             </tr>
             <tr class="sig-excluded">
               <td data-label="Family">deepseek-v4-flash</td>
@@ -112,7 +112,7 @@
             <div class="delta-cell">
               <label for="d1">T1</label>
               <input type="number" id="d1" name="d1" inputmode="numeric" min="0" max="10000" step="1" placeholder="0">
-              <span class="delta-name">id+accuse</span>
+              <span class="delta-name">id+emoji</span>
             </div>
             <div class="delta-cell">
               <label for="d2">T2</label>
@@ -122,12 +122,12 @@
             <div class="delta-cell">
               <label for="d3">T3</label>
               <input type="number" id="d3" name="d3" inputmode="numeric" min="0" max="10000" step="1" placeholder="0">
-              <span class="delta-name">code</span>
+              <span class="delta-name">js_code</span>
             </div>
             <div class="delta-cell">
               <label for="d4">T4</label>
               <input type="number" id="d4" name="d4" inputmode="numeric" min="0" max="10000" step="1" placeholder="0">
-              <span class="delta-name">cjk+emoji</span>
+              <span class="delta-name">cjk+emoji+math</span>
             </div>
             <div class="delta-cell">
               <label for="d5">T5</label>
@@ -204,6 +204,7 @@
       <ul class="probe-list">
         <li class="reveal"><code>--sleep S</code><span>seconds between requests, default 2</span></li>
         <li class="reveal"><code>--timeout S</code><span>per-request timeout, default 60</span></li>
+        <li class="reveal"><code>retries</code><span>a dropped request is tried three times, and a reasoning route that answers 502 climbs a max_tokens ladder, 64 then 512 then 2048</span></li>
       </ul>
 
       <p class="probe-group reveal">Offline</p>
@@ -214,12 +215,12 @@
 
     <figure class="terminal reveal" data-ui>
       <pre><code><span class="t-prompt">$</span> python scripts/verify_gateway.py selftest
-SELFTEST (v3.0): 54 passed, 0 failed
+SELFTEST (v3.0): 61 passed, 0 failed
 
 <span class="t-prompt">$</span> VERIFY_API_KEY=sk-... python scripts/verify_gateway.py \
     --base https://gw.example.com/v1 --model "vendor/model-id"
 <span class="caret" aria-hidden="true"></span></code></pre>
-      <figcaption>The offline check runs without a key or a network. 54 assertions, Python standard library only.</figcaption>
+      <figcaption>The offline check runs without a key or a network. 61 assertions, Python standard library only.</figcaption>
     </figure>
   </section>
 
@@ -233,22 +234,23 @@ SELFTEST (v3.0): 54 passed, 0 failed
       <li class="spine fam-anthropic"><a href="https://github.com/SNNN-011/model-authenticity-verifier/blob/main/references/tokenizer-baselines-2026-10.md"><span class="spine-name">anthropic-core</span><span class="spine-delta">45 40 35 45 47</span></a></li>
       <li class="spine fam-anthropic"><a href="https://github.com/SNNN-011/model-authenticity-verifier/blob/main/references/tokenizer-baselines-2026-10.md"><span class="spine-name">anthropic-4.6</span><span class="spine-delta">35 34 29 46 47</span></a></li>
       <li class="spine fam-openai"><a href="https://github.com/SNNN-011/model-authenticity-verifier/blob/main/references/tokenizer-baselines-2026-10.md"><span class="spine-name">openai</span><span class="spine-delta">24 24 22 30 29</span></a></li>
-      <li class="spine fam-deepseek"><a href="https://github.com/SNNN-011/model-authenticity-verifier/blob/main/references/tokenizer-baselines-2026-10.md"><span class="spine-name">deepseek</span><span class="spine-delta">27 26 23 32 25</span></a></li>
+      <li class="spine fam-deepseek"><a href="https://github.com/SNNN-011/model-authenticity-verifier/blob/main/references/tokenizer-baselines-2026-10.md"><span class="spine-name">deepseek</span><span class="spine-delta">14 20 18 27 22</span></a></li>
       <li class="spine fam-excluded"><a href="https://github.com/SNNN-011/model-authenticity-verifier/blob/main/references/tokenizer-baselines-2026-10.md"><span class="spine-name">deepseek-v4-flash</span><span class="spine-delta spine-anomaly">no usable reference</span></a></li>
     </ul>
 
-    <p class="shelf-legend reveal">Sand spines: Anthropic families. anthropic-core covers claude-opus-4.7, claude-opus-4.8, claude-opus-5, claude-sonnet-5; anthropic-4.6 covers claude-opus-4.6 and claude-sonnet-4.6. Slate: openai, gpt-5.6-terra and gpt-5.6-sol. Pale: deepseek, deepseek-v4-pro and deepseek-v4.1-flash-1017. The marked spine is excluded from matching: deepseek-v4-flash showed nondeterministic usage accounting, so no usable reference exists. 11 of 32 models were measured; the rest are still open.</p>
+    <p class="shelf-legend reveal">Sand spines: Anthropic families. anthropic-core covers claude-opus-4.7, claude-opus-4.8, claude-opus-5, claude-sonnet-5; anthropic-4.6 covers claude-opus-4.6 and claude-sonnet-4.6. Slate: openai, gpt-5.6-terra and gpt-5.6-sol. Pale: deepseek, deepseek-v4-pro and deepseek-v4.1-flash-1017. The marked spine is excluded from matching: deepseek-v4-flash showed nondeterministic usage accounting, so no usable reference exists. The deepseek spine is the one measured with the collector's own texts, 2026-11-16; the other three come from the 2026-10-29 set and are reference only.</p>
   </section>
 
   <section class="verdicts" aria-labelledby="verdicts-title">
-    <h2 id="verdicts-title" class="reveal">Seven verdicts.</h2>
+    <h2 id="verdicts-title" class="reveal">Eight verdicts.</h2>
     <dl class="verdict-list">
-      <div class="verdict-row reveal"><dt>Signature match</dt><dd>Four or five of five texts agree with the claimed family's signature. Weak evidence: same dialect, not the same weights.</dd></div>
-      <div class="verdict-row reveal"><dt>Partial match</dt><dd>Two or three agree. Re-run with fresh texts before concluding.</dd></div>
-      <div class="verdict-row reveal"><dt>Signature mismatch</dt><dd>Zero or one agrees. The tokenizer does not look like that family.</dd></div>
+      <div class="verdict-row reveal"><dt>Signature match</dt><dd>All five texts agree with the claimed family's signature. Weak evidence: same dialect, not the same weights.</dd></div>
+      <div class="verdict-row reveal"><dt>Partial match</dt><dd>Four of five agree. One text that misses is an anomaly, not a family split. Re-run with fresh texts.</dd></div>
+      <div class="verdict-row reveal"><dt>Signature mismatch</dt><dd>Three or fewer agree. The tokenizer does not look like that family.</dd></div>
       <div class="verdict-row reveal"><dt>Unmeasured family</dt><dd>No reference for the claimed model. The deltas are reported raw.</dd></div>
       <div class="verdict-row reveal"><dt>Unstable accounting</dt><dd>The control count moved between repeats. Nothing can be concluded.</dd></div>
-      <div class="verdict-row reveal"><dt>Endpoint unavailable</dt><dd>Dead, not fake.</dd></div>
+      <div class="verdict-row reveal"><dt>Probe incomplete</dt><dd>The route answered but some texts could not be measured. The deltas are partial, so no verdict is drawn.</dd></div>
+      <div class="verdict-row reveal"><dt>Endpoint unavailable</dt><dd>Timeout, refusal or an HTTP error. Dead is not fake, and neither is a refusal.</dd></div>
       <div class="verdict-row reveal"><dt>No usage reported</dt><dd>The gateway returned no token usage, so the method could not run.</dd></div>
     </dl>
   </section>
@@ -290,7 +292,7 @@ SELFTEST (v3.0): 54 passed, 0 failed
       <ul>
         <li><a href="https://github.com/affaan-m/ECC">Everything Claude Code</a></li>
         <li><span>v3.0, November 2026</span></li>
-        <li><span>Selftest: 54 assertions</span></li>
+        <li><span>Selftest: 61 assertions</span></li>
       </ul>
     </div>
   </div>

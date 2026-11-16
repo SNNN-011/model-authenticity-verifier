@@ -31,10 +31,10 @@
   if (!form || !panel) return;
 
   var families = [
-    { key: 'anthropic-core', signature: [45, 40, 35, 45, 47] },
-    { key: 'anthropic-4.6', signature: [35, 34, 29, 46, 47] },
-    { key: 'openai', signature: [24, 24, 22, 30, 29] },
-    { key: 'deepseek', signature: [27, 26, 23, 32, 25] }
+    { key: 'anthropic-core', signature: [45, 40, 35, 45, 47], comparable: false },
+    { key: 'anthropic-4.6', signature: [35, 34, 29, 46, 47], comparable: false },
+    { key: 'openai', signature: [24, 24, 22, 30, 29], comparable: false },
+    { key: 'deepseek', signature: [14, 20, 18, 27, 22], comparable: true }
   ];
 
   var inputs = [1, 2, 3, 4, 5].map(function (n) {
@@ -85,35 +85,36 @@
     }
 
     var results = families.map(function (family) {
-      return { key: family.key, result: score(deltas, family.signature) };
+      return { key: family.key, comparable: family.comparable, result: score(deltas, family.signature) };
     });
 
     matchCells.forEach(function (cell) {
       var entry = results.filter(function (item) { return item.key === cell.getAttribute('data-family'); })[0];
-      if (entry) cell.textContent = entry.result.matched + ' of 5';
+      if (entry) cell.textContent = entry.comparable ? entry.result.matched + ' of 5' : 'other text set';
     });
 
-    var best = results.slice().sort(function (a, b) {
+    var comparable = results.filter(function (item) { return item.comparable; });
+    var best = comparable.slice().sort(function (a, b) {
       if (b.result.matched !== a.result.matched) return b.result.matched - a.result.matched;
       return a.result.deviation - b.result.deviation;
     })[0];
 
     var verdict;
     var meaning;
-    if (best.result.matched >= 4) {
+    if (best.result.matched >= 5) {
       verdict = 'SIGNATURE MATCH';
-      meaning = 'Four or five of five texts agree. Same counting dialect as ' + best.key + ', not proof of the same weights.';
-    } else if (best.result.matched >= 2) {
+      meaning = 'All five texts agree with the ' + best.key + ' signature. Same counting dialect, not proof of the same weights.';
+    } else if (best.result.matched === 4) {
       verdict = 'PARTIAL MATCH';
-      meaning = 'Two or three of five agree with ' + best.key + '. Mixed. Re-run with fresh texts before concluding anything.';
+      meaning = 'Four of five agree with ' + best.key + '. One text that misses is an anomaly, not a family split: re-run with fresh texts.';
     } else {
       verdict = 'SIGNATURE MISMATCH';
-      meaning = 'Zero or one of five agrees with any measured family. The tokenizer does not look like the claimed family’s.';
+      meaning = best.result.matched + ' of five agree with ' + best.key + '. The tokenizer does not look like that family.';
     }
 
     word.textContent = verdict;
     say.textContent = meaning;
-    count.textContent = results.map(function (item) {
+    count.textContent = comparable.map(function (item) {
       return item.key + ' ' + item.result.matched + '/5';
     }).join(' · ');
     driver.textContent = 'Best family: ' + best.key + ' (' + best.result.matched + ' of 5, deviation ' + best.result.deviation + '). Tolerance: max(2, ceil(0.08 x reference)).';
