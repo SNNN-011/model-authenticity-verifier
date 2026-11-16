@@ -1,122 +1,149 @@
-# Methodology: verifying a model behind an API - what research actually supports
+# Methodology: input-side tokenizer diff - what the research supports
 
-Reference for `model-authenticity-verifier` (v2.2). Summarizes the published black-box
-auditing literature and maps each technique to the probes in `scripts/verify_gateway.py`.
+Reference for `model-authenticity-verifier` (v3.0). One method only:
+**input-side tokenizer diff against measured family signatures**. This file
+records why that method is the one left standing, what the published
+literature does and does not licence here, and where the signal runs out.
 
 ## TL;DR
 
-- Black-box model verification is **evidence accumulation and hypothesis testing**, not proof.
-  Proof needs weights, a vendor-embedded keyed fingerprint, or TEE attestation.
-- The strongest practical black-box method for a user holding an official API key is
-  **differential testing against the official endpoint** (output-space similarity).
-- **Self-report is one-directional**: contradiction is evidence, agreement is not.
-- Wrapping a model (system prompts, RAG, templates) *degrades* fingerprint reliability -
-  and that is exactly what gateways do. So "no match to baseline" is weaker evidence
-  than a positive contradiction.
-- Core capabilities of top-tier models converge; **style and behavioral structure** is
-  where top-tier discrimination lives.
+- The method reads the token count of the **prompt** from the response's
+  `usage` block, subtracts a control, and compares the five deltas against a
+  measured per-family signature. It is a tokenizer fingerprint built from
+  engineering practice, not from a formal paper.
+- The signal it yields is **WEAK by construction**. Usage numbers are
+  testimony, not measurement (R1): a proxy can re-tokenize locally with the
+  claimed family's tokenizer and forge `usage` without ever serving the
+  claimed model. A signature match gates the counting dialect, never the
+  weights.
+- What proof would require is not available over plain black-box HTTP. Nothing
+  short of it should be sold as authenticity verification.
 
-## Taxonomy
+## Why a tokenizer fingerprint works at all
 
-- Fingerprinting vs watermarking: watermarking proves text came from a watermarked
-  model; fingerprinting tries to *identify* the model behind a black box without
-  cooperation. Keyed verification can be definitive; similarity-based attribution is
-  statistical. (Survey: arXiv 2605.29245.)
-- White-box (weights/gradients) vs black-box (queries only). Black-box splits into
-  untargeted (what is this?) and targeted (is this model X?).
-  (SoK: arXiv 2508.19843.)
-- The SoK's LeaFBench benchmark (149 model instances, 13 post-development techniques
-  including parameter-independent ones such as system-prompt conditioning and RAG)
-  shows parameter-independent modifications measurably degrade fingerprint accuracy.
-  Consequence for this skill: a gateway injecting a system prompt can shift behavior
-  away from the stock model, so capability drift alone is not proof of substitution.
+Tokenizers differ between model families: vocabulary size, merge rules,
+byte-level fallbacks, handling of mixed script, emoji and code. The same
+string almost never tokenizes identically across two families'
+tokenizers, and engineering practice (no formal paper) treats the input-side
+token count of a fixed text as a cheap, reproducible fingerprint.
 
-## Techniques that work black-box (ranked by evidence strength)
+Two supporting premises from the literature:
 
-1. **Output-space similarity / differential testing** (arXiv 2407.01235).
-   Model outputs occupy a characteristic subspace; comparing victim vs suspect output
-   distributions across the same prompts separates models. Practical version: run the
-   same deterministic battery against suspect and official endpoints at temperature 0
-   and compare pass rates, exact outputs, and token counts.
-2. **Behavioral profiling** (arXiv 2509.04504).
-   Diagnostic prompt suites + judging produce behavioral profiles (style, alignment,
-   refusals). Caveat from the same field: raw capabilities converge among top models,
-   so profile *shape* discriminates where scores do not.
-3. **Statistical consistency testing** (arXiv 2606.07996).
-   Hypothesis testing on hit rates against a reference corpus with significance
-   thresholds. Practical version: repeat probes; inconsistency between identical
-   requests is itself a finding.
-4. **Natural fingerprints** (arXiv 2504.14871).
-   Models remain distinguishable even when trained on the same data with different
-   seeds - the premise that makes black-box comparison meaningful at all.
-5. **Tokenizer / usage signatures** (engineering practice, no formal paper needed).
-   `completion_tokens` for the same forced output is effectively a tokenizer
-   fingerprint; different tokenizers almost never agree on a 100+ char string.
-6. **Capability discrimination** (weakest of the useful ones).
-   A deterministic battery (multi-step math, counting, logic, format constraints) plus
-   a long-context needle detects *tier* substitution reliably, and top-tier
-   substitution poorly. Use it to catch cheap substitutes, not to bless expensive ones.
+- **Natural fingerprints** (arXiv 2504.14871). Models remain distinguishable
+  even when trained on identical data with different seeds. This is the
+  premise that makes any black-box comparison meaningful, including this one.
+- **Statistical consistency testing** (arXiv 2606.07996). Hypothesis testing
+  on hit rates against a reference corpus with significance thresholds. The
+  practical reading here: repeat the measurement, and treat instability
+  itself as a finding. That is exactly what `--repeat` does with the control -
+  if the control's token count moves between repeats, the route's usage
+  accounting is not deterministic and the run is discarded
+  (`UNSTABLE ACCOUNTING`, R5).
 
-## What proof requires (not available via plain black-box HTTP)
+The related control-subtraction step is also engineering practice, not a
+paper. `delta(T) = tokens(T) - tokens("a")` on the same path cancels that
+path's template and system-prompt overhead, so counts are comparable across
+routes without a third control endpoint (R2). Never compare raw token
+counts across paths.
 
-- **Embedded keyed fingerprints** (arXiv 2401.12255). Definitive, but the model owner
-  must implant them - not usable against a third-party gateway.
-- **TEE / hardware attestation.** AttestLLM (arXiv 2509.06326) verifies on-device model
-  integrity via attestation; confidential-computing deployments such as Petridish
-  (arXiv 2409.19134) run inference inside enclaves with signed receipts.
-- **Attested provenance for APIs.** AEX (arXiv 2603.14283) audits shadow APIs and notes
-  existing methods - fingerprinting, model-equality testing, verifiable inference, TEE
-  attestation - "either remain inferential or answer different questions". The
-  evidence-bound gateway provenance work (arXiv 2606.22560) formalizes the threat:
-  gateways decide routing, fallback, stream manipulation, and may forge provenance.
-  Realistic recourse: only an attested gateway runtime produces proof.
+## Family-dividing texts
 
-## Mapping: research -> probes in verify_gateway.py
+A single text is not a fingerprint (R3). Plain repeated ASCII and long
+plain English agree across most families and prove nothing, which is why the
+probe set uses only texts that divide families: mixed-script multilingual
+prose, emoji sequences, code one-liners, mixed arithmetic. Family agreement
+is scored across several texts; single-text outliers inside an agreeing
+family are anomalies, not splits. The measured anomalies are recorded in
+`field-notes-2026-10.md`.
 
-| Probe | Research basis | Can show | Cannot show |
-|---|---|---|---|
-| infra: wrapper fields, x-headers, model echo | engineering practice | which gateway/proxy stack runs | model identity |
-| service: prompt-token overhead, output caps, reasoning dialect | service audit | what the gateway mutates in your traffic | who serves the traffic |
-| caps: deterministic battery | capability discrimination (#6) | tier/family gaps; cheap substitutes | top-tier swaps |
-| caps: needle-in-haystack | context-window claims | claimed vs usable context | exact weight identity |
-| self: identity/cutoff x2 | one-directional rule | contradictions; response instability | never positive evidence |
-| diff: battery outputs vs baseline | output-space similarity (#1), (#4) | strong same/different evidence | formal proof (batch nondeterminism) |
-| diff: forced-output token counts | tokenizer signature (#5) | same/different tokenizer & upstream (WEAK: usage is forgeable; only scored after client-side text+ratio cross-check) | formal proof |
-| diff: logprobs comparison (--logprobs) | distribution matching (#1) | strong same/different evidence (top-1 tokens + \|delta logprob\|) | rarely exposed by gateways; a proxy can compute plausible logprobs |
+The probe set was measured on 2026-10-29 against the audited gateway, with a
+text set whose exact strings live only on the audit machine. The collector's
+built-in texts are public stand-ins with the same composition (id+accuse,
+jv+price, code, cjk+emoji, arab+misc), not the same bytes (R6). An exact
+match is therefore indicative, and a deviation has to be re-measured before
+it counts.
 
-## Honest limitations of this skill
+## The fingerprint-degradation caveat (arXiv 2508.19843)
 
-- No statistical significance machinery: the battery is 8 seedable items + dual-depth
-  needle (single sample per item). Raise repetitions (future work) before making
-  fine-grained claims. The open-ended Jaccard probe is single-sample and scored WEAK.
-- Behavioral profiling (style/judge analysis) is manual; the script does not attempt it.
-- Differential testing requires an official API key - the case where you least need the
-  gateway. Gateways often also differ in *dialect* (token counts, empty content with
-  reasoning), which the script notes rather than penalizes.
-- Everything the script prints is subject to the LeaFBench caveat: parameter-independent
-  wrapping degrades fingerprints. Treat a match as corroboration and a mismatch as
-  grounds for investigation, not conviction.
+The SoK on LLM copyright auditing via fingerprinting introduces LeaFBench
+(149 model instances, 13 post-development techniques, including
+parameter-independent ones such as system-prompt conditioning and RAG) and
+shows that parameter-independent modifications measurably degrade fingerprint
+accuracy.
+
+Consequence here: gateways wrap models. A wrapper, system prompt or
+re-tokenizer sits between the caller and the model, and each of those can
+shift what gets counted or how. So:
+
+- a **match** is corroboration, never confirmation;
+- a **mismatch** is grounds for investigation, never conviction;
+- the method cannot separate "wrong model" from "wrapped right model with
+  degraded fingerprinting" without additional evidence.
+
+Treat every family verdict with this caveat attached.
+
+## What proof would require (not available over plain black-box HTTP)
+
+- **Weights.** Inspection or an embedded keyed fingerprint requires owner
+  cooperation (e.g. arXiv 2401.12255). Not usable against a third-party
+  gateway.
+- **TEE / hardware attestation.** AttestLLM (arXiv 2509.06326) verifies
+  on-device model integrity via attestation. Confidential-computing
+  deployments such as Petridish (arXiv 2409.19134) run inference inside
+  enclaves with signed receipts. Only an attested runtime produces proof a
+  caller can check; almost no public gateway offers one.
+- **Attested provenance for APIs.** AEX (arXiv 2603.14283) audits shadow
+  APIs and notes that existing methods - fingerprinting, model-equality
+  testing, verifiable inference, TEE attestation - "either remain
+  inferential or answer different questions". The evidence-bound
+  gateway-path provenance work (arXiv 2606.22560) formalises the threat:
+  gateways decide routing, fallback and stream manipulation, and may forge
+  provenance.
+
+Over black-box HTTP with a bearer key, none of this is reachable. The survey
+taxonomy (arXiv 2605.29245) frames the situation cleanly: keyed verification
+can be definitive; similarity-based attribution is statistical. This method
+is the statistical kind.
+
+## Research -> probe -> verdict
+
+| Research / basis | Probe mechanism | Verdict effect |
+|---|---|---|
+| Tokenizer engineering practice | `usage.input_tokens` / `usage.prompt_tokens` deltas per text | all family verdicts |
+| Control subtraction (engineering practice) | `delta(T) = tokens(T) - tokens("a")`, same path (R2) | makes cross-route deltas comparable |
+| Natural fingerprints (arXiv 2504.14871) | premise: families tokenise distinguishably | `SIGNATURE MATCH` / `SIGNATURE MISMATCH` (WEAK) |
+| Statistical consistency (arXiv 2606.07996) | `--repeat`, control compared across repeats (R5) | `UNSTABLE ACCOUNTING` when the control moves |
+| Parameter-independent degradation (arXiv 2508.19843) | caveat on every reading | caps match at WEAK FOR; mismatch = investigate, not convict |
+| AEX / gateway-provenance threat (arXiv 2603.14283, 2606.22560) | reason the method cannot prove identity | report wording: WEAK FOR / mismatch, never "verified genuine" |
+
+## Explicit statement on signal strength
+
+This method yields a **WEAK signal by construction**. It can show that a
+route counts tokens the way a claimed family's tokenizer does. It cannot show
+that the route serves that family's weights, and it cannot exclude a proxy
+that keeps the claimed family's tokenizer for counting while serving
+something else entirely. Any stronger claim requires weights, an owner-keyed
+fingerprint, or attested hardware, none of which a bearer-key HTTP endpoint
+exposes.
+
+## Honest limitations
+
+- Usage is forgeable end to end; every verdict is capped at WEAK (R1).
+- The built-in texts are stand-ins for the measured set; exact-match
+  indications degrade gracefully into "re-measure before you conclude" (R6).
+- A route with nondeterministic usage accounting cannot be fingerprinted at
+  all (`UNSTABLE ACCOUNTING`); `deepseek-v4-flash` is the known case.
+- No statistical significance machinery beyond the tolerance rule and the
+  repeat check; no confidence intervals are computed or printed.
 
 ## Sources
 
-- 2605.29245 - Survey: fingerprinting/watermarking taxonomy (keyed verification vs
-  similarity-based attribution). https://arxiv.org/abs/2605.29245
-- 2508.19843 - SoK: LLM copyright auditing via fingerprinting; LeaFBench; black-box
-  untargeted/targeted taxonomy. https://arxiv.org/abs/2508.19843
-- 2407.01235 - A Fingerprint for Large Language Models (output-subspace similarity).
-  https://arxiv.org/abs/2407.01235
 - 2504.14871 - Natural Fingerprints of Large Language Models. https://arxiv.org/abs/2504.14871
-- 2509.04504 - Behavioral Fingerprinting of Large Language Models.
-  https://arxiv.org/abs/2509.04504
-- 2606.07996 - MC-PDD: black-box pretraining-data detection via statistical hit rates.
-  https://arxiv.org/abs/2606.07996
-- 2603.14283 - AEX: non-intrusive multi-hop attestation and provenance for LLM APIs
-  (shadow-API audits). https://arxiv.org/abs/2603.14283
-- 2606.22560 - Evidence-bound gateway-path provenance for third-party LLM inference.
-  https://arxiv.org/abs/2606.22560
-- 2509.06326 - AttestLLM: hardware attestation for on-device LLM integrity.
-  https://arxiv.org/abs/2509.06326
-- 2409.19134 - Petridish: confidential-computing deployment for LLM inference.
-  https://arxiv.org/abs/2409.19134
-- 2401.12255 - Instructional Fingerprinting of Large Language Models (requires owner
-  cooperation). https://arxiv.org/abs/2401.12255
+- 2606.07996 - MC-PDD: black-box pretraining-data detection via statistical hit rates. https://arxiv.org/abs/2606.07996
+- 2508.19843 - SoK: LLM copyright auditing via fingerprinting; LeaFBench; black-box untargeted/targeted taxonomy. https://arxiv.org/abs/2508.19843
+- 2401.12255 - Instructional Fingerprinting of Large Language Models (requires owner cooperation). https://arxiv.org/abs/2401.12255
+- 2509.06326 - AttestLLM: hardware attestation for on-device LLM integrity. https://arxiv.org/abs/2509.06326
+- 2409.19134 - Petridish: confidential-computing deployment for LLM inference. https://arxiv.org/abs/2409.19134
+- 2603.14283 - AEX: non-intrusive multi-hop attestation and provenance for LLM APIs (shadow-API audits). https://arxiv.org/abs/2603.14283
+- 2606.22560 - Evidence-bound gateway-path provenance for third-party LLM inference. https://arxiv.org/abs/2606.22560
+- 2605.29245 - Survey: fingerprinting/watermarking taxonomy (keyed verification vs similarity-based attribution). https://arxiv.org/abs/2605.29245
