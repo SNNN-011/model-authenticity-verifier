@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "family": "deepseek",
+  "models": [
+    "deepseek/deepseek-v4-pro",
+    "deepseek/deepseek-v4.1-flash-1017",
+    "deepseek-v4.1-flash"
+  ],
+  "probe_set_id": "6dfaca77",
+  "signature": [
+    14,
+    20,
+    18,
+    27,
+    22
+  ],
+  "control_range": [
+    5,
+    31
+  ],
+  "confidence": "multi-route-third-party",
+  "provenance": {
+    "endpoint_kind": "third-party-gateway",
+    "routes": [
+      "sumopod",
+      "tokenharbor",
+      "vikey",
+      "yeta"
+    ],
+    "date": "2026-11-16",
+    "n_runs": 6,
+    "notes": "Control \"a\" counted 5 on sumopod and tokenharbor, and 31 on vikey and yeta; the control is subtracted per path, so the deltas are unaffected. T4 was 27 on the two runs that agree with the older (2026-10-29) baseline and 26 on the other four; 27 is used because it matches the older measured baseline and does not change a verdict within tolerance (max(2, ceil(0.08*27)) = 3). See references/field-notes-2026-11.md."
+  }
+}

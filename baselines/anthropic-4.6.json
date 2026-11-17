@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "family": "anthropic-4.6",
+  "models": [
+    "anthropic/claude-opus-4.6",
+    "anthropic/claude-sonnet-4.6"
+  ],
+  "probe_set_id": "6dfaca77",
+  "signature": [
+    18,
+    25,
+    20,
+    36,
+    38
+  ],
+  "control_range": [
+    23,
+    23
+  ],
+  "confidence": "single-route",
+  "provenance": {
+    "endpoint_kind": "third-party-gateway",
+    "routes": [
+      "vikey"
+    ],
+    "date": "2026-11-16",
+    "n_runs": 1,
+    "notes": "Single run on vikey (anthropic/claude-sonnet-4.6) with control 23. The values 18 25 20 36 38 are read as deltas (dibaca sebagai delta), by analogy with the deepseek row in field-notes-2026-11.md, not as raw token counts."
+  }
+}

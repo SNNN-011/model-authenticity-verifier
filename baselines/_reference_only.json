@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "rows": [
+    {
+      "family": "anthropic-core",
+      "models": ["anthropic/claude-opus-4.7", "claude-opus-4.8", "claude-opus-5", "anthropic/claude-sonnet-5"],
+      "notes": "The 2026-10-29 signature 45 40 35 45 47 is reference only (R6): measured on a text set whose exact strings were never published, so the collector cannot compare its deltas against it. Kept here for lookup and for the record only; this row never supplies a signature."
+    },
+    {
+      "family": "openai",
+      "models": ["openai/gpt-5.6-terra", "openai/gpt-5.6-sol"],
+      "notes": "The 2026-10-29 signature 24 24 22 30 29 is reference only (R6): measured on a text set whose exact strings were never published. Kept here for lookup and for the record only; this row never supplies a signature."
+    },
+    {
+      "family": "anthropic-4.6",
+      "models": ["anthropic/claude-opus-4.6", "anthropic/claude-sonnet-4.6"],
+      "superseded": true,
+      "superseded_signature": [35, 34, 29, 46, 47],
+      "notes": "The 2026-10-29 signature 35 34 29 46 47 is reference only (R6) and is superseded by the 2026-11-16 vikey measurement in baselines/anthropic-4.6.json (18 25 20 36 38). Historical value kept under superseded_signature for the record only; the loader ignores it."
+    },
+    {
+      "family": "deepseek",
+      "models": ["deepseek/deepseek-v4-pro", "deepseek/deepseek-v4.1-flash-1017", "deepseek-v4.1-flash"],
+      "superseded": true,
+      "superseded_signature": [27, 26, 23, 32, 25],
+      "notes": "The 2026-10-29 signature 27 26 23 32 25 is reference only (R6) and is superseded by the 2026-11-16 multi-route measurement in baselines/deepseek.json (14 20 18 27 22). Historical value kept under superseded_signature for the record only; the loader ignores it."
+    }
+  ]
+}

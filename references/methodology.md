@@ -78,12 +78,54 @@ is scored across several texts; single-text outliers inside an agreeing
 family are anomalies, not splits. The measured anomalies are recorded in
 `field-notes-2026-10.md`.
 
-The probe set was measured on 2026-10-29 against the audited gateway, with a
-text set whose exact strings live only on the audit machine. The collector's
-built-in texts are public stand-ins with the same composition (id+accuse,
-jv+price, code, cjk+emoji, arab+misc), not the same bytes (R6). An exact
-match is therefore indicative, and a deviation has to be re-measured before
-it counts.
+The collector's built-in texts are public stand-ins for the 2026-10-29
+measured set (id+accuse, jv+price, code, cjk+emoji, arab+misc), not the
+same bytes (R6). The active baselines in `baselines/` were measured on
+2026-11-16 with the collector's own built-in texts, so for those families
+the comparison happens inside one text set. The 2026-10-29 signatures
+remain reference only: a delta taken from the collector's texts cannot be
+compared with them.
+
+## Baselines and fail-closed loading
+
+Active baselines live in `baselines/*.json`. Each active file carries
+`schema_version`, `family`, `models`, `probe_set_id`, `signature`,
+`control_range`, `provenance` (endpoint kind, routes, date, run count,
+notes) and optionally `confidence`. The `probe_set_id` is computed from
+`PROBES` by the collector (sha256 over the control and probe texts,
+truncated to 8 hex chars) and stored in the file; at load time the loader
+recomputes it from the current probe set and refuses the file when they
+differ. Changing one byte of the probe texts invalidates every active
+baseline by design.
+
+Loading is fail closed. Corrupt JSON, an unreadable file, a non-object
+root, an unknown `schema_version`, a signature whose length does not match
+the probe set, a `probe_set_id` mismatch, a duplicate family, an active
+file marked superseded or a file whose models do not map back to its
+family all raise an explicit error naming the file; the run exits 1 before
+any network request. Nothing is skipped silently.
+
+`baselines/_reference_only.json` carries family and model names only,
+never a signature. Rows there are for lookup and the historical record
+(the superseded 2026-10-29 deepseek and anthropic-4.6 values live under
+`superseded_signature`); the loader ignores `superseded_signature` for
+scoring. A family that appears only in `_reference_only.json` yields
+`UNMEASURED FAMILY` with a note naming the file and citing R6; the deltas
+are reported raw so they can be baselined later.
+
+Every family verdict that uses an active baseline (`SIGNATURE MATCH`,
+`PARTIAL MATCH`, `SIGNATURE MISMATCH`, `UNSTABLE ACCOUNTING`, including
+the control-instability and family-unstable cases) carries a
+third-party-gateway caveat: a wrapper can re-tokenize locally or forge
+usage, so a match is WEAK evidence for the counting dialect, never the
+weights (R1).
+
+The `anthropic-4.6` baseline comes from a single vikey run
+(anthropic/claude-sonnet-4.6, control 23). Its values 18 25 20 36 38 are
+read as deltas, by analogy with the deepseek row in
+`field-notes-2026-11.md`, not as raw token counts; the assumption is
+recorded in the file's provenance notes. Treat it as single-route,
+low-confidence evidence.
 
 ## The fingerprint-degradation caveat (arXiv 2508.19843)
 
@@ -136,7 +178,7 @@ is the statistical kind.
 | Natural fingerprints (arXiv 2504.14871) | premise: families tokenise distinguishably | `SIGNATURE MATCH` / `SIGNATURE MISMATCH` (WEAK) |
 | Statistical consistency (arXiv 2606.07996) | `--repeat`, control and every text compared across repeats (R5) | `UNSTABLE ACCOUNTING` when the control moves or no stable verdict is possible |
 | Parameter-independent degradation (arXiv 2508.19843) | caveat on every reading | caps match at WEAK FOR; mismatch = investigate, not convict |
-| AEX / gateway-provenance threat (arXiv 2603.14283, 2606.22560) | reason the method cannot prove identity | report wording: WEAK FOR / mismatch, never "verified genuine" |
+| AEX / gateway-provenance threat (arXiv 2603.14283, 2606.22560) | reason the method cannot prove identity | report wording: WEAK FOR / mismatch, never stronger than WEAK FOR |
 
 ## Explicit statement on signal strength
 
@@ -151,8 +193,9 @@ exposes.
 ## Honest limitations
 
 - Usage is forgeable end to end; every verdict is capped at WEAK (R1).
-- The built-in texts are stand-ins for the measured set; exact-match
-  indications degrade gracefully into "re-measure before you conclude" (R6).
+- Only the two active baselines were measured with the collector's own
+  texts; every other family is reference only and its 2026-10-29 numbers
+  cannot be compared with the collector's deltas (R6).
 - A route with nondeterministic usage accounting cannot be fingerprinted at
   all (`UNSTABLE ACCOUNTING`); `deepseek-v4-flash` is the known case.
 - No statistical significance machinery beyond the tolerance rule and the

@@ -8,17 +8,29 @@ public text set: control `a` plus T1 id+emoji, T2 jv+price, T3 js_code, T4
 cjk+emoji+math, T5 arab+misc. A delta taken from one set cannot be compared
 with a signature measured on the other.
 
-The **live** signature for the collector is the deepseek one, measured with
-the collector's own texts on 2026-11-16:
+The **live** signatures for the collector ship in `baselines/` and were
+measured with the collector's own texts on 2026-11-16:
 
 ```
-deepseek: 14 20 18 27 22   (control 5 / 31 depending on the route)
+deepseek:      14 20 18 27 22   (control 5 / 31 depending on the route)
+anthropic-4.6: 18 25 20 36 38   (single vikey run, control 23; values read
+                                 as deltas, by analogy with the deepseek row)
 ```
 
-with the per-route measurements in
-[`field-notes-2026-11.md`](field-notes-2026-11.md). The other three families
-below have no signature on this text set yet, so the collector reports
-`UNMEASURED FAMILY` for them instead of guessing.
+Each active baseline stores a `probe_set_id` computed from the collector's
+probe set; the loader recomputes it at load time and refuses the file when
+they differ, so changing one byte of the probe texts invalidates every
+active baseline by design. Loading is fail closed: a corrupt or mismatched
+file stops the run with an error naming the file. See
+[`field-notes-2026-11.md`](field-notes-2026-11.md) for the per-route
+measurements.
+
+The other two rows below (`anthropic-core` and `openai`) have no signature
+on this text set and are reference only, in `baselines/_reference_only.json`,
+which never supplies a signature: the collector reports `UNMEASURED FAMILY`
+with an R6 note for them instead of guessing. The 2026-10-29 `deepseek` and
+`anthropic-4.6` rows are kept there as superseded history
+(`superseded_signature`), not used for scoring.
 
 Everything under "Per-model deltas" is the 2026-10-29 record: reference only.
 
@@ -64,13 +76,19 @@ delta(T) = input_tokens(T) - input_tokens("a"), per path, stream off.
   T1 = 45 matches the official Claude Code path of the public 2026-10-18 recipe.
 - **anthropic-4.6 branch** (claude-opus-4.6, claude-sonnet-4.6): (35, 34, 29, 46, 47) -
   a distinct signature shared by exactly the 4.6 generation pair. Tentatively
-  an older tokenizer branch; unverified, treat as its own signature.
+  an older tokenizer branch; treat as its own signature. Superseded for
+  collector scoring by the 2026-11-16 measurement (18, 25, 20, 36, 38) in
+  `baselines/anthropic-4.6.json`; kept in `baselines/_reference_only.json`
+  as `superseded_signature`.
 - **openai** (gpt-5.6-terra/sol): (24, 24, 22, 30, 29). T1 = 24 matches the
-  public recipe's GPT-family route.
+  public recipe's GPT-family route. Reference only (`_reference_only.json`).
 - **deepseek** (deepseek-v4-pro and deepseek-v4.1-flash-1017): (27, 26, 23, 32, 25); T1 = 27
   matches the public recipe's DeepSeek route. The two models report
   different raw control counts (5 vs 31) - different path overhead, equal
-  deltas, which is exactly what the subtraction is for.
+  deltas, which is exactly what the subtraction is for. Superseded for
+  collector scoring by the 2026-11-16 measurement (14, 20, 18, 27, 22) in
+  `baselines/deepseek.json`; kept in `baselines/_reference_only.json` as
+  `superseded_signature`.
 - **deepseek-v4-flash**: (27, 88, 85, 94, 87) on the first scan - **superseded
   by a retest, not usable as a reference**. Retest 2026-10-29 (two passes):
   at mt16 the deltas read 27, 26, 23, (T4 502), 26 - family-consistent;

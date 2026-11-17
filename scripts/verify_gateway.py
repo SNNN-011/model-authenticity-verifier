@@ -3,12 +3,14 @@
 # Method: delta(T) = tokens(T) - tokens("a") on the same path, compared to family signatures.
 import argparse
 import contextlib
+import hashlib
 import http.server
 import io
 import json
 import math
 import os
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -37,14 +39,24 @@ PROBES = [
     ("T5 arab+misc", "\u0645\u0631\u062d\u0628\u0627 \u0628\u0627\u0644\u0639\u0627\u0644\u0645 \u0661\u0662\u0663 \u03a9\u22483.14 \u2211(x_i) \u2014 na\u00efve caf\u00e9"),
 ]
 
-# Reference signatures: 5 deltas (T1..T5).
-# Only the deepseek family was measured with the probe texts above, so it is the
-# only signature this collector can judge. The other families are known as
-# families, but their numbers come from the 2026-10-29 scan, whose texts were
-# never published, so they stay out of the comparison (R6).
-REFERENCE = {
-    "deepseek": [14, 20, 18, 27, 22],
-}
+# Baseline loading (fail closed). Active baselines live in baselines/*.json and
+# carry a probe_set_id computed from PROBES below; changing one byte of the
+# probe set invalidates every active baseline by design. Reference-only family
+# names live in baselines/_reference_only.json and never supply a signature.
+BASELINE_DIR = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "baselines"))
+REFERENCE_ONLY_FILE = "_reference_only.json"
+BASELINE_SCHEMA_VERSION = 1
+BASELINE_CAVEAT = "third-party-gateway caveat: a wrapper can re-tokenize locally or forge usage, so this is WEAK evidence for the counting dialect, never the weights (R1)"
+
+
+class BaselineError(Exception):
+    pass
+
+
+def probe_set_id():
+    payload = [CONTROL_TEXT] + [text for _, text in PROBES]
+    blob = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(blob).hexdigest()[:8]
 
 # ids both resolve. `deepseek-v4-flash` matches none of these on purpose.
 _MODEL_KEYS = {
@@ -128,6 +140,151 @@ def map_family(model_id):
         if key in mid:
             return family
     return None
+
+
+def _is_int_list(value, length):
+    return (isinstance(value, list) and len(value) == length
+            and all(isinstance(v, int) and not isinstance(v, bool) for v in value))
+
+
+def _load_json_file(path, fname):
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            raw = fh.read()
+    except OSError as e:
+        raise BaselineError("%s: cannot read file: %s" % (fname, e))
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise BaselineError("%s: invalid JSON: %s" % (fname, e))
+    if not isinstance(data, dict):
+        raise BaselineError("%s: root must be a JSON object" % fname)
+    version = data.get("schema_version")
+    if (not isinstance(version, int) or isinstance(version, bool)
+            or version != BASELINE_SCHEMA_VERSION):
+        raise BaselineError("%s: unknown schema_version %r (expected %d)" % (
+            fname, version, BASELINE_SCHEMA_VERSION))
+    return data
+
+
+def _validate_reference_only(data, fname):
+    rows = data.get("rows")
+    if not isinstance(rows, list):
+        raise BaselineError("%s: root object must carry a 'rows' list" % fname)
+    names = []
+    for i, row in enumerate(rows):
+        if not isinstance(row, dict):
+            raise BaselineError("%s: rows[%d] must be an object" % (fname, i))
+        family = row.get("family")
+        models = row.get("models")
+        if not isinstance(family, str) or not family.strip():
+            raise BaselineError("%s: rows[%d] missing non-empty 'family' string" % (fname, i))
+        if (not isinstance(models, list) or not models
+                or not all(isinstance(m, str) and m.strip() for m in models)):
+            raise BaselineError("%s: rows[%d] family %r needs a non-empty 'models' list of strings" % (fname, i, family))
+        if "signature" in row:
+            raise BaselineError("%s: rows[%d] family %r carries a 'signature' key; "
+                                "reference-only rows never supply a signature" % (fname, i, family))
+        if "superseded_signature" in row:
+            if row.get("superseded") is not True:
+                raise BaselineError("%s: rows[%d] family %r carries superseded_signature without \"superseded\": true" % (fname, i, family))
+            if not _is_int_list(row["superseded_signature"], len(PROBES)):
+                raise BaselineError("%s: rows[%d] family %r superseded_signature must be a list of %d integers" % (fname, i, family, len(PROBES)))
+        names.append(family)
+    return names
+
+
+def _validate_active(data, fname):
+    family = data.get("family")
+    models = data.get("models")
+    pid = data.get("probe_set_id")
+    sig = data.get("signature")
+    cr = data.get("control_range")
+    provenance = data.get("provenance")
+    for field, value in (("family", family), ("models", models), ("probe_set_id", pid),
+                         ("signature", sig), ("control_range", cr), ("provenance", provenance)):
+        if value is None:
+            raise BaselineError("%s: missing required field %r" % (fname, field))
+    if data.get("superseded"):
+        raise BaselineError("%s: active baseline %r is marked superseded; "
+                            "superseded rows belong in %s" % (fname, family, REFERENCE_ONLY_FILE))
+    if not isinstance(family, str) or not family.strip():
+        raise BaselineError("%s: 'family' must be a non-empty string" % fname)
+    if (not isinstance(models, list) or not models
+            or not all(isinstance(m, str) and m.strip() for m in models)):
+        raise BaselineError("%s: 'models' must be a non-empty list of non-empty strings" % fname)
+    for m in models:
+        if map_family(m) != family:
+            raise BaselineError("%s: model %r does not map to family %r via map_family" % (fname, m, family))
+    if pid != probe_set_id():
+        raise BaselineError("%s: probe_set_id %r does not match the current probe set %r; "
+                            "the baseline is invalidated" % (fname, pid, probe_set_id()))
+    if not _is_int_list(sig, len(PROBES)):
+        raise BaselineError("%s: 'signature' must be a list of exactly %d integers" % (fname, len(PROBES)))
+    if (not isinstance(cr, list) or len(cr) != 2
+            or not all(isinstance(v, int) and not isinstance(v, bool) for v in cr)):
+        raise BaselineError("%s: 'control_range' must be a list of two integers" % fname)
+    if cr[0] > cr[1]:
+        raise BaselineError("%s: 'control_range' min %d exceeds max %d" % (fname, cr[0], cr[1]))
+    if not isinstance(provenance, dict):
+        raise BaselineError("%s: 'provenance' must be an object" % fname)
+    if provenance.get("endpoint_kind") != "third-party-gateway":
+        raise BaselineError("%s: provenance.endpoint_kind must be 'third-party-gateway'" % fname)
+    routes = provenance.get("routes")
+    if (not isinstance(routes, list) or not routes
+            or not all(isinstance(r, str) and r.strip() for r in routes)):
+        raise BaselineError("%s: provenance.routes must be a non-empty list of strings" % fname)
+    if not isinstance(provenance.get("date"), str) or not provenance["date"].strip():
+        raise BaselineError("%s: provenance.date must be a non-empty string" % fname)
+    n_runs = provenance.get("n_runs")
+    if not isinstance(n_runs, int) or isinstance(n_runs, bool) or n_runs < 1:
+        raise BaselineError("%s: provenance.n_runs must be an integer >= 1" % fname)
+    if not isinstance(provenance.get("notes"), str):
+        raise BaselineError("%s: provenance.notes must be a string" % fname)
+    confidence = data.get("confidence")
+    if confidence is not None and not isinstance(confidence, str):
+        raise BaselineError("%s: 'confidence' must be a string when present" % fname)
+    return {
+        "family": family,
+        "models": list(models),
+        "probe_set_id": pid,
+        "signature": list(sig),
+        "control_range": list(cr),
+        "confidence": confidence,
+        "provenance": dict(provenance),
+        "source": fname,
+    }
+
+
+def load_baselines(directory=None):
+    """Load and validate baselines/*.json. Fail closed: every bad file raises
+    BaselineError naming the file; nothing is skipped silently.
+
+    Returns (active_by_family, reference_only_names). Reference-only rows are
+    used for lookup only and never supply a signature.
+    """
+    directory = directory or BASELINE_DIR
+    try:
+        entries = sorted(os.listdir(directory))
+    except OSError as e:
+        raise BaselineError("cannot read baseline directory %s: %s" % (directory, e))
+    active = {}
+    reference_only_names = []
+    for fname in entries:
+        if not fname.endswith(".json"):
+            continue
+        path = os.path.join(directory, fname)
+        data = _load_json_file(path, fname)
+        if fname == REFERENCE_ONLY_FILE:
+            reference_only_names.extend(_validate_reference_only(data, fname))
+            continue
+        record = _validate_active(data, fname)
+        family = record["family"]
+        if family in active:
+            raise BaselineError("%s: duplicate family %r (already defined by %s)" % (
+                fname, family, active[family]["source"]))
+        active[family] = record
+    return active, reference_only_names
 
 
 def tolerance(reference):
@@ -334,8 +491,18 @@ def probe_once(base, model, key, text, dialect_holder, timeout, attempts=3, budg
 def build_report(base, model, dialect, control_tokens_list, probe_results, family,
                  signature, matches, verdict, note, failed_probes=None,
                  total_texts=None, unstable_texts=None, budget=None,
-                 estimated_requests=None):
+                 estimated_requests=None, baseline=None):
     control_unstable = (len(control_tokens_list) > 1 and is_unstable(control_tokens_list))
+    if family:
+        reference = {"family": family, "signature": signature}
+        if baseline:
+            reference["probe_set_id"] = baseline.get("probe_set_id")
+            if baseline.get("confidence") is not None:
+                reference["confidence"] = baseline["confidence"]
+            reference["provenance"] = baseline.get("provenance")
+            reference["source"] = baseline.get("source")
+    else:
+        reference = None
     report = {
         "tool": TOOL,
         "version": VERSION,
@@ -351,7 +518,7 @@ def build_report(base, model, dialect, control_tokens_list, probe_results, famil
             "max": max(control_tokens_list) if control_tokens_list else None,
             "unstable": control_unstable,
         },
-        "reference": ({"family": family, "signature": signature} if family else None),
+        "reference": reference,
         "probes": probe_results,
         "matches": matches,
         "texts_total": total_texts if total_texts is not None else len(probe_results),
@@ -397,6 +564,13 @@ def run(args, api_key=None):
         print("error: --max-requests must be >= 0", file=sys.stderr)
         return 1
 
+    # Fail closed before any network request: a bad baseline file is an error, not a skip.
+    try:
+        active_baselines, reference_only_names = load_baselines()
+    except BaselineError as e:
+        print("error: %s" % e, file=sys.stderr)
+        return 1
+
     custom_texts = bool(args.texts)
     if custom_texts:
         try:
@@ -411,7 +585,8 @@ def run(args, api_key=None):
         texts = PROBES
 
     family = None if custom_texts else map_family(args.model)
-    signature = REFERENCE.get(family) if family else None
+    baseline = active_baselines.get(family) if family else None
+    signature = baseline["signature"] if baseline else None
     n_texts = len(texts)
     estimated = estimate_run_requests(n_texts, args.repeat)
     print("estimated requests: %d (control + %d texts, repeat %d; retries and the max_tokens ladder can add more)" % (
@@ -550,7 +725,11 @@ def run(args, api_key=None):
             note += "; %d text(s) moved beyond tolerance across repeats and were not scored (R5)" % len(unstable_texts)
     elif signature is None:
         verdict = decide(family=None)
-        note = "the %s family is known, but no signature was measured with these texts; deltas reported raw (R6)" % family
+        if family in reference_only_names:
+            note = "the %s family appears only in %s, whose rows carry no signature; deltas reported raw so they can be baselined later (R6)" % (
+                family, REFERENCE_ONLY_FILE)
+        else:
+            note = "the %s family is known, but no signature was measured with these texts; deltas reported raw (R6)" % family
         if unstable_texts:
             note += "; %d text(s) moved beyond tolerance across repeats and were not scored (R5)" % len(unstable_texts)
     else:
@@ -558,11 +737,16 @@ def run(args, api_key=None):
                          unstable_texts=len(unstable_texts))
         note = verdict_note(verdict, matches, n_texts, len(unstable_texts))
 
+    if baseline is not None and verdict in (
+            "SIGNATURE MATCH", "PARTIAL MATCH", "SIGNATURE MISMATCH", "UNSTABLE ACCOUNTING"):
+        note += "; " + BASELINE_CAVEAT
+
     report = build_report(args.base, args.model, dialect, control_tokens_all,
                           probe_results, family, signature,
                           matches, verdict, note, failed_probes,
                           total_texts=n_texts, unstable_texts=unstable_texts,
-                          budget=budget, estimated_requests=estimated)
+                          budget=budget, estimated_requests=estimated,
+                          baseline=baseline)
 
     print("base: %s" % args.base)
     print("model: %s" % args.model)
@@ -1149,12 +1333,141 @@ def selftest():
     check("mock budget exhausted on repeat 1 control yields probe incomplete", lambda: (
         code == 0 and "verdict: PROBE INCOMPLETE" in out and "ENDPOINT UNAVAILABLE" not in out))
 
+    # --- baselines: active load & integrity ---
+    try:
+        active_baselines, reference_only_families = load_baselines()
+        baselines_load_error = None
+    except BaselineError as e:
+        active_baselines, reference_only_families = {}, []
+        baselines_load_error = str(e)
+
+    check("active baselines load without error", lambda: baselines_load_error is None)
+    check("every active probe_set_id matches probe_set_id()", lambda: bool(active_baselines) and all(
+        b["probe_set_id"] == probe_set_id() for b in active_baselines.values()))
+    check("active families are exactly deepseek and anthropic-4.6", lambda: sorted(active_baselines) == ["anthropic-4.6", "deepseek"])
+    check("deepseek active signature and confidence", lambda: (
+        active_baselines["deepseek"]["signature"] == [14, 20, 18, 27, 22]
+        and active_baselines["deepseek"]["confidence"] == "multi-route-third-party"))
+    check("anthropic-4.6 active signature and confidence", lambda: (
+        active_baselines["anthropic-4.6"]["signature"] == [18, 25, 20, 36, 38]
+        and active_baselines["anthropic-4.6"]["confidence"] == "single-route"))
+    check("anthropic-4.6 provenance notes read deltas by deepseek analogy", lambda: (
+        "read as deltas" in active_baselines["anthropic-4.6"]["provenance"]["notes"]
+        and "deepseek" in active_baselines["anthropic-4.6"]["provenance"]["notes"]))
+
+    pid = probe_set_id()
+
+    def active_file(family, models, signature, **overrides):
+        data = {"schema_version": BASELINE_SCHEMA_VERSION, "family": family, "models": models,
+                "probe_set_id": pid, "signature": signature, "control_range": [5, 31],
+                "provenance": {"endpoint_kind": "third-party-gateway", "routes": ["route-a"],
+                               "date": "2026-11-16", "n_runs": 1, "notes": "test row"}}
+        data.update(overrides)
+        return json.dumps(data)
+
+    def baseline_error(files):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for name, content in files.items():
+                with open(os.path.join(tmpdir, name), "w", encoding="utf-8") as fh:
+                    fh.write(content)
+            try:
+                load_baselines(tmpdir)
+            except BaselineError as e:
+                return str(e)
+        return None
+
+    check("fail closed: corrupt JSON names the file", lambda: "bad.json" in (
+        baseline_error({"bad.json": "{not json"}) or ""))
+    check("fail closed: wrong signature length names the file", lambda: "short.json" in (
+        baseline_error({"short.json": active_file("deepseek", ["deepseek/deepseek-v4-pro"], [1, 2, 3])}) or ""))
+    check("fail closed: unknown schema_version names the file", lambda: "v2.json" in (
+        baseline_error({"v2.json": active_file("deepseek", ["deepseek/deepseek-v4-pro"],
+                                               [14, 20, 18, 27, 22], schema_version=2)}) or ""))
+    check("fail closed: boolean schema_version names the file", lambda: "boolver.json" in (
+        baseline_error({"boolver.json": active_file("deepseek", ["deepseek/deepseek-v4-pro"],
+                                                    [14, 20, 18, 27, 22], schema_version=True)}) or ""))
+    check("fail closed: probe_set_id mismatch names the file", lambda: "pid.json" in (
+        baseline_error({"pid.json": active_file("deepseek", ["deepseek/deepseek-v4-pro"],
+                                                [14, 20, 18, 27, 22], probe_set_id="deadbeef")}) or ""))
+    check("fail closed: duplicate family names the file", lambda: "dup.json" in (
+        baseline_error({"a.json": active_file("deepseek", ["deepseek/deepseek-v4-pro"], [14, 20, 18, 27, 22]),
+                        "dup.json": active_file("deepseek", ["deepseek-v4.1-flash"], [14, 20, 18, 27, 22])}) or ""))
+    check("fail closed: active superseded true names the file", lambda: "sup.json" in (
+        baseline_error({"sup.json": active_file("deepseek", ["deepseek/deepseek-v4-pro"],
+                                                [14, 20, 18, 27, 22], superseded=True)}) or ""))
+    check("fail closed: reference-only row carrying signature names the file", lambda: "_reference_only.json" in (
+        baseline_error({"_reference_only.json": json.dumps(
+            {"schema_version": BASELINE_SCHEMA_VERSION,
+             "rows": [{"family": "ghost", "models": ["ghost/model"], "signature": [1, 2, 3, 4, 5]}]})}) or ""))
+
+    def ghost_reference_only():
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with open(os.path.join(tmpdir, REFERENCE_ONLY_FILE), "w", encoding="utf-8") as fh:
+                json.dump({"schema_version": BASELINE_SCHEMA_VERSION,
+                           "rows": [{"family": "ghost-family", "models": ["ghost/model"],
+                                     "superseded": True, "superseded_signature": [1, 2, 3, 4, 5]}]}, fh)
+            active, names = load_baselines(tmpdir)
+            return active == {} and names == ["ghost-family"]
+
+    check("reference-only rows never supply a signature", ghost_reference_only)
+    check("default reference-only file lists anthropic-core and openai", lambda: (
+        "anthropic-core" in reference_only_families and "openai" in reference_only_families))
+
+    def reference_only_rows_superseded():
+        with open(os.path.join(BASELINE_DIR, REFERENCE_ONLY_FILE), "r", encoding="utf-8") as fh:
+            rows = json.load(fh)["rows"]
+        by_family = {row["family"]: row for row in rows}
+        return (by_family["anthropic-4.6"].get("superseded") is True
+                and by_family["deepseek"].get("superseded") is True
+                and all("signature" not in row for row in rows))
+
+    check("default reference-only file keeps old rows superseded without signature keys", reference_only_rows_superseded)
+
+    code, out = scenario_run("honest", model="anthropic/claude-opus-4.8")
+    check("mock reference-only family yields unmeasured family with R6 note", lambda: (
+        "verdict: UNMEASURED FAMILY" in out and "_reference_only.json" in out and "R6" in out))
+
+    code, out = scenario_run("honest")
+    check("caveat present on signature match", lambda: (
+        "verdict: SIGNATURE MATCH" in out and "third-party-gateway caveat" in out))
+
+    code, out = scenario_run("constant")
+    check("caveat present on signature mismatch", lambda: (
+        "verdict: SIGNATURE MISMATCH" in out and "third-party-gateway caveat" in out))
+
+    code, out = scenario_run("shift_t1")
+    check("caveat present on partial match", lambda: (
+        "verdict: PARTIAL MATCH" in out and "third-party-gateway caveat" in out))
+
+    code, out = scenario_run("drifting_control", repeat=2)
+    check("caveat present on unstable accounting", lambda: (
+        "verdict: UNSTABLE ACCOUNTING" in out and "third-party-gateway caveat" in out))
+
+    code, out = scenario_run("honest", max_requests=2)
+    check("PROBE INCOMPLETE carries no baseline caveat", lambda: (
+        "verdict: PROBE INCOMPLETE" in out and "third-party-gateway caveat" not in out))
+
+    def mock_report_carries_baseline():
+        server, base = start_gateway("honest")
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                target = os.path.join(tmpdir, "report.json")
+                run_capture(args_for(base, out=target))
+                with open(target, "r", encoding="utf-8") as fh:
+                    report = json.load(fh)
+        finally:
+            stop_gateway(server)
+        ref = report.get("reference") or {}
+        return ref.get("probe_set_id") == probe_set_id() and ref.get("confidence") == "multi-route-third-party"
+
+    check("mock report carries baseline probe_set_id and confidence", mock_report_carries_baseline)
+
     total = len(results)
     failed = [d for d, ok in results if not ok]
     passed = total - len(failed)
 
-    if total != 127:
-        print("SELFTEST (v3.1): internal error, expected 127 assertions, ran %d" % total, file=sys.stderr)
+    if total != 151:
+        print("SELFTEST (v3.1): internal error, expected 151 assertions, ran %d" % total, file=sys.stderr)
         return 2
     if failed:
         for d in failed:

@@ -57,12 +57,17 @@ R5. **Unstable accounting invalidates a run.** If the control count moves
     is counted in the note. A family mismatch needs at least two stably
     measured misses; with fewer than two, the result is `UNSTABLE ACCOUNTING`,
     not `SIGNATURE MISMATCH`.
-R6. **The text set is part of the measurement.** The reference signatures
-    were measured on 2026-10-29 with a text set of the same composition
-    (id+accuse, jv+price, code, cjk+emoji, arab+misc) whose exact strings
-    live only on the audit machine. The collector's built-in texts are public
-    stand-ins with the same composition, so an exact match is indicative, and
-    a deviation has to be re-measured before it counts.
+R6. **The text set is part of the measurement.** The active baselines were
+    measured on 2026-11-16 with the collector's own built-in texts and are
+    stored in `baselines/*.json`; the loader recomputes a `probe_set_id`
+    from the probe set and refuses any baseline whose stored id does not
+    match, so the comparison is only ever made inside one text set. The
+    older 2026-10-29 signatures were measured with a text set of the same
+    composition (id+accuse, jv+price, code, cjk+emoji, arab+misc) whose
+    exact strings live only on the audit machine. Those rows are reference
+    only and live in `baselines/_reference_only.json`, which never supplies
+    a signature; a family that appears only there yields `UNMEASURED FAMILY`
+    and the deltas are reported raw.
 
 ## Workflow
 
@@ -130,17 +135,32 @@ denominator and are reported in the note, never silently dropped.
 
 Family signature = 5 deltas in the order T1..T5. The collector ships one text
 set (control `a` plus T1 id+emoji, T2 jv+price, T3 js_code, T4 cjk+emoji+math,
-T5 arab+misc). The `deepseek` row was measured with exactly those texts on
-2026-11-16, so it is the only row this collector can judge. The other rows
-come from the 2026-10-29 scan, whose text set was never published: reference
-only, not comparable with the collector's deltas (R6).
+T5 arab+misc). Active baselines live in `baselines/*.json` and were measured
+with exactly those texts; each stores a `probe_set_id` that the loader
+recomputes from `PROBES` at load time, so changing one byte of the probe
+texts invalidates every active baseline by design. Loading is fail closed: a
+corrupt, malformed or mismatched baseline file stops the run with an error
+naming the file (exit 1); nothing is skipped silently. The older rows come
+from the 2026-10-29 scan, whose text set was never published: they live in
+`baselines/_reference_only.json` (reference only, never a signature, not
+comparable with the collector's deltas, R6). The old 2026-10-29 `deepseek`
+and `anthropic-4.6` rows are kept there as superseded history.
 
 | family key | models | signature | text set |
 |---|---|---|---|
 | `deepseek` | deepseek/deepseek-v4-pro, deepseek/deepseek-v4.1-flash-1017, deepseek-v4.1-flash | 14 20 18 27 22 | collector's, 2026-11-16 |
-| `anthropic-core` | anthropic/claude-opus-4.7, claude-opus-4.8, claude-opus-5, claude-sonnet-5 | 45 40 35 45 47 | 2026-10-29, reference only |
-| `anthropic-4.6` | anthropic/claude-opus-4.6, anthropic/claude-sonnet-4.6 | 35 34 29 46 47 | 2026-10-29, reference only |
-| `openai` | openai/gpt-5.6-terra, openai/gpt-5.6-sol | 24 24 22 30 29 | 2026-10-29, reference only |
+| `anthropic-4.6` | anthropic/claude-opus-4.6, anthropic/claude-sonnet-4.6 | 18 25 20 36 38 | collector's, 2026-11-16, single vikey run; values read as deltas by analogy with the deepseek row |
+
+Reference-only (`baselines/_reference_only.json`): `anthropic-core`
+(45 40 35 45 47), `openai` (24 24 22 30 29), and the superseded 2026-10-29
+`deepseek` (27 26 23 32 25) and `anthropic-4.6` (35 34 29 46 47) rows.
+Reference-only entries carry family/model names only and never a signature;
+a family that appears only there yields `UNMEASURED FAMILY` with an R6 note.
+Every verdict that uses an active baseline (`SIGNATURE MATCH`,
+`PARTIAL MATCH`, `SIGNATURE MISMATCH`, `UNSTABLE ACCOUNTING`) carries a
+third-party-gateway caveat: a wrapper can re-tokenize locally or forge
+usage, so this is WEAK evidence for the counting dialect, never the weights
+(R1).
 
 Model id to family matching: longest key first, case-insensitive substring
 match on the model id. `deepseek-v4-flash` has no usable reference
@@ -151,7 +171,8 @@ and maps to no family: `UNMEASURED FAMILY`.
 
 - Usage is forgeable; a determined proxy can count with a copied tokenizer.
   Every family verdict is WEAK FOR/AGAINST at best.
-- The built-in texts are stand-ins for the measured 2026-10-29 set (R6).
+- Only the two active baselines (deepseek, anthropic-4.6) were measured with
+  the collector's own texts; every other family is reference only (R6).
 - Known anomaly routes: `claude-sonnet-5` T5 and `claude-opus-4.7` T4, single
   texts inside agreeing families. Re-run flagged texts.
 - `deepseek-v4-flash` is not fingerprintable with this method today (R5).
@@ -167,6 +188,7 @@ and maps to no family: `UNMEASURED FAMILY`.
 ## Files
 
 - `scripts/verify_gateway.py` - the collector (stdlib only, has selftest)
+- `baselines/` - active baselines (`deepseek.json`, `anthropic-4.6.json`) and `_reference_only.json` (family/model lookup only, never a signature)
 - `references/methodology.md` - the research basis, WEAK by construction
 - `references/tokenizer-baselines-2026-10.md` - measured signatures, usage rules
 - `references/field-notes-2026-10.md` - raw numbers behind the 2026-10-29 baselines
