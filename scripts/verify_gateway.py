@@ -898,6 +898,71 @@ def selftest():
         post_fake.get("result") == (200, {"usage": {"prompt_tokens": 7}})
         and post_fake.get("timeout") == 5))
 
+    # --- README probe block matches PROBES (permanent guard) ---
+    def readme_probe_texts():
+        readme = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "README.md")
+        with io.open(readme, "r", encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+        try:
+            start = next(i for i, l in enumerate(lines) if l.strip() == "Control: `a`")
+        except StopIteration:
+            raise ValueError("'Control: `a`' line not found")
+        i = start + 1
+        while i < len(lines) and lines[i].strip() != "```":
+            i += 1
+        if i >= len(lines):
+            raise ValueError("opening ``` fence after 'Control: `a`' not found")
+        block = []
+        i += 1
+        while i < len(lines) and lines[i].strip() != "```":
+            block.append(lines[i])
+            i += 1
+        if i >= len(lines):
+            raise ValueError("closing ``` fence not found")
+        probe_names = {n for n, _ in PROBES}
+        texts = []
+        i = 0
+        while i < len(block):
+            stripped = block[i].strip()
+            if not stripped:
+                i += 1
+                continue
+            if stripped.endswith(":") and stripped[:-1].strip() in probe_names:
+                name = stripped[:-1].strip()
+                i += 1
+                if i >= len(block) or not block[i].strip():
+                    raise ValueError("probe %r has no text line" % name)
+                texts.append((name, block[i]))
+                i += 1
+                continue
+            raise ValueError("unexpected line in probe block: %r" % block[i])
+        if [n for n, _ in texts] != [n for n, _ in PROBES]:
+            raise ValueError("probe order/count differs from PROBES: %s" % [n for n, _ in texts])
+        return texts
+
+    def readme_matches_probes():
+        try:
+            texts = readme_probe_texts()
+        except (OSError, ValueError) as e:
+            print("README probe block parse error: %s" % e, file=sys.stderr)
+            return False
+        expected = list(PROBES)
+        if texts != expected:
+            for (got_name, got_text), (want_name, want_text) in zip(texts, expected):
+                if got_name != want_name or got_text != want_text:
+                    print("README probe block mismatch on %s" % want_name, file=sys.stderr)
+                    for col, (a, b) in enumerate(zip(got_text, want_text)):
+                        if a != b:
+                            print("  first diff at col %d: U+%04X vs U+%04X" % (col, ord(a), ord(b)), file=sys.stderr)
+                            break
+                    else:
+                        print("  length differs: %d vs %d codepoints" % (len(got_text), len(want_text)), file=sys.stderr)
+                    return False
+            return len(texts) == len(expected)
+        return True
+
+    check("README probe block parses and matches PROBES exactly", readme_matches_probes)
+
     # --- report safety & shape (group H, 2) ---
     sentinel = "sk-sentinel-never-in-report"
     report = build_report("https://gw.example.com/v1", "m", "openai", [5], [], "openai",
@@ -1088,8 +1153,8 @@ def selftest():
     failed = [d for d, ok in results if not ok]
     passed = total - len(failed)
 
-    if total != 126:
-        print("SELFTEST (v3.1): internal error, expected 126 assertions, ran %d" % total, file=sys.stderr)
+    if total != 127:
+        print("SELFTEST (v3.1): internal error, expected 127 assertions, ran %d" % total, file=sys.stderr)
         return 2
     if failed:
         for d in failed:

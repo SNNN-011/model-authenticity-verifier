@@ -139,10 +139,10 @@ T3 js_code:
 const total = items.reduce((a, b) => a + b.price, 0);
 
 T4 cjk+emoji+math:
-混合中文、日本語とemoji 🌍🚀 と計算: 17×23=391、128÷4=32
+混合中文、日本語とemoji 🌌🚀 と計算: 17×23=391、128÷4=32
 
 T5 arab+misc:
-مرحبا بالعالم ١٢٣ Ω×3.14 ∑(x_i) — naïve café
+مرحبا بالعالم ١٢٣ Ω≈3.14 ∑(x_i) — naïve café
 ```
 
 ## Honest limits
