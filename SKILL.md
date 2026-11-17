@@ -86,8 +86,11 @@ R6. **The text set is part of the measurement.** The active baselines were
    --max-requests N (stop and report PROBE INCOMPLETE when the request budget
    is exhausted; the estimate is printed before the run),
    --out FILE (full JSON), --texts FILE (alternate text set, reference
-   comparison skipped). Offline logic check: `python scripts/verify_gateway.py
-   selftest`, exits 0 on pass.
+   comparison skipped), --with-consistency (also run the consistency suite;
+   notes only, the verdict is unchanged), --stream (with --with-consistency,
+   add the streaming check). Suite-only: `verify_gateway.py consistency
+   --base <URL> --model <ID> [--stream]`. Offline logic check:
+   `python scripts/verify_gateway.py selftest`, exits 0 on pass.
 
 3. Decide. All N texts match: `SIGNATURE MATCH` (WEAK FOR). Exactly N-1
    match: `PARTIAL MATCH`; re-run with fresh texts. N-2 or fewer match with
@@ -138,6 +141,50 @@ least one delta exists), the note gains `usage_suspect` with the
 delta; 0 when there are no deltas. Every HTTP attempt, retries and
 max_tokens ladder rungs included, passes through the request budget, and the
 estimated request count is printed before the run starts.
+
+## Consistency suite (notes only)
+
+`--with-consistency` runs a second suite after the probe run; `python
+scripts/verify_gateway.py consistency --base <URL> --model <ID>` runs only
+the suite. Both are notes only (R1): no result changes the verdict. Every
+request passes through the request budget, and the estimate is printed
+before the first request. The family verdict is byte-identical with and
+without `--with-consistency`.
+
+- **Usage linearity vs repetition.** Three unit texts (ASCII, CJK-Japanese
+  mix, emoji) at repetition counts k = 1, 2, 3, 5, 8. Text for k is the unit
+  text joined into k newline-separated repetitions; `delta = tokens(text_k)
+  - tokens(control)`, control measured once. Each unit fits
+  `statistics.linear_regression(k_values, deltas)`; the report records k
+  list, deltas, slope, intercept, max residual, monotonic_increasing and a
+  residual tolerance `max(2, ceil(0.08 * max(deltas)))`. `usage_suspect` is
+  set when the series is constant, slope is `<= 0`, the deltas are not
+  strictly increasing, or the max residual exceeds the tolerance; the reason
+  says which. This k is a repetition count, unrelated to the
+  `quantization_k` ladder above.
+- **Determinism.** The same unit text is sent twice and the input-side
+  token counts compared exactly. A difference is recorded and noted, never
+  a verdict change.
+- **Streaming (`--stream`).** The same unit text is sent once non-streaming
+  and once with `"stream": true`. The SSE body is parsed (lines starting
+  with `data:`; the final object carrying `usage` wins; `[DONE]` ignored)
+  and its input-side count is compared with the non-streaming value. If the
+  route rejects streaming or answers without a usable usage block,
+  `agree` is null and the note says `stream unavailable`.
+- **Side evidence.** `Server`, `Via` and `X-Request-Id` from the first
+  consistency response are recorded, plus the model id the server echoes vs
+  the requested model (`model_matches`, case-insensitive). A differing echo
+  is a side-evidence note only (R1).
+
+The `consistency` report block gains `linearity`, `determinism`, `stream`
+(only with `--stream`), `side_evidence` and `notes`. The consistency-only
+path prints `estimated consistency requests: 16 (1 control + 3 units x 5 k
+values; plus 2 determinism, plus 2 when --stream, plus 0 for headers
+because they ride on existing responses)` before the first request;
+`--with-consistency` prints the probe estimate then a combined line, e.g.
+`estimated requests: 22 (6 probe + 16 consistency)`. Consistency
+exhaustion of the budget stops the suite and records `consistency
+incomplete: request budget exhausted` as a note only.
 
 ## What This Can and Cannot Show
 

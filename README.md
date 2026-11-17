@@ -180,6 +180,80 @@ through the request budget (`--max-requests`). The estimated request count is
 printed before the run starts; it counts the control plus the texts per
 repeat and does not include retries or ladder rungs.
 
+## Consistency suite (notes only)
+
+Beside the probe run, the collector can measure three more properties of a
+route's usage accounting. Everything here is a note: no result changes the
+verdict (R1). Every HTTP attempt passes through the request budget
+(`--max-requests`), and the estimate is printed before the first request.
+
+Run only the suite:
+
+```bash
+python scripts/verify_gateway.py consistency --base URL --model ID \
+    [--key-stdin] [--sleep] [--timeout] [--max-requests] [--out FILE] [--stream]
+```
+
+Or run it after a probe run with `--with-consistency` on the normal command.
+The family verdict is byte-identical with and without the flag; the suite's
+results are appended to the report under `consistency["linearity"]`,
+`consistency["determinism"]`, `consistency["stream"]` (only with `--stream`),
+`consistency["side_evidence"]` and `consistency["notes"]`, and a short
+`consistency:` block is printed after the verdict. Combined with `--out`, the
+combined estimate is reflected in `budget.estimated`.
+
+### Usage linearity vs repetition
+
+Three plain unit texts are measured at repetition counts
+`k = 1, 2, 3, 5, 8`: an ASCII sentence, a CJK-Japanese mix and an emoji
+sequence. The text for `k` is the unit text joined into `k` newline-separated
+repetitions, measured on the same path as everything else. `delta =
+tokens(text_k) - tokens(control)` with the control measured once. For each
+unit, `statistics.linear_regression(k_values, deltas)` fits the repetition
+series; the report records `slope`, `intercept`, `max_residual` (max
+`|delta - (slope*k + intercept)|`), `monotonic_increasing` (strictly
+increasing at every step), the residual tolerance
+`max(2, ceil(0.08 * max(deltas)))`, and a `usage_suspect` flag with a short
+reason. A unit is flagged `usage_suspect` when its series is constant, its
+slope is `<= 0`, the deltas are not strictly increasing, or the max residual
+exceeds the tolerance. This `k` is a repetition count, unrelated to the
+`quantization_k` ladder of the usage-unit consistency check.
+
+### Determinism
+
+The same unit text (the ASCII one) is sent twice and the two input-side
+token counts are compared exactly. A difference is recorded
+(`deterministic: false`) and noted; it never changes a verdict (R1).
+
+### Streaming (`--stream`)
+
+The same unit text is sent once non-streaming and once with
+`"stream": true`. The SSE body is parsed (lines starting with `data:`; the
+final object carrying `usage` wins; `[DONE]` is ignored) and its input-side
+token count is compared with the non-streaming value. If the route does not
+answer the streaming request with a usable usage block, `agree` is null and
+the note says `stream unavailable`. Never changes the verdict (R1).
+
+### Side evidence
+
+The headers on the first consistency response are recorded (`Server`,
+`Via`, `X-Request-Id`), together with the model id the server echoes in the
+response body versus the model that was requested (`model_matches`,
+case-insensitive). A differing echo is recorded as a side-evidence note
+only (R1). Side evidence alone never changes a verdict.
+
+### Budget and estimate
+
+Every consistency request goes through the same `RequestBudget` as the
+probes; exhaustion stops the suite and records `consistency incomplete:
+request budget exhausted` as a note only. The consistency-only path prints
+`estimated consistency requests: 16 (1 control + 3 units x 5 k values; plus
+2 determinism, plus 2 when --stream, plus 0 for headers because they ride
+on existing responses)` before the first request; `--with-consistency`
+prints the probe estimate followed by a combined line, e.g.
+`estimated requests: 22 (6 probe + 16 consistency)`. Headers ride on
+existing responses, so they add no requests.
+
 ## The probe texts
 
 Five family-dividing texts plus the control `a`. Plain repeated ASCII and

@@ -174,6 +174,82 @@ through the request budget (`--max-requests`). The estimated request count is
 printed before the run starts; it counts the control plus the texts per
 repeat and excludes retries and ladder rungs.
 
+## The consistency suite (notes only)
+
+Phase 2b adds a second, independent set of checks on a route's usage
+accounting. Everything the suite reports is a note: it is appended to the
+report and printed, and it never picks, changes or vetoes a verdict (R1).
+Every HTTP attempt the suite makes passes through the same request budget
+(`--max-requests`) as the probes, and the estimate is printed before the
+first request.
+
+Two entry points. `--with-consistency` on the normal probe run executes the
+suite after the probes finish and merges the results into the report under
+`consistency["linearity"]`, `consistency["determinism"]`,
+`consistency["stream"]` (only with `--stream`), `consistency["side_evidence"]`
+and `consistency["notes"]`, then prints a short `consistency:` block after
+the verdict; the verdict line is byte-identical with and without the flag.
+`python scripts/verify_gateway.py consistency --base URL --model ID
+[--key-stdin] [--sleep] [--timeout] [--max-requests] [--out FILE]
+[--stream]` runs only the suite. The suite makes one control request, 15
+linearity requests (3 units x 5 repetition counts) and 2 determinism
+requests; `--stream` adds a non-streaming and a streaming send. Headers
+ride on the first consistency response and add no requests. Exhausting the
+budget stops the suite and records `consistency incomplete: request budget
+exhausted` as a note only. The estimates printed before the first request
+are `estimated consistency requests: 16 (1 control + 3 units x 5 k values;
+plus 2 determinism, plus 2 when --stream, plus 0 for headers because they
+ride on existing responses)` for the consistency-only path, and, with
+`--with-consistency`, the probe estimate followed by a combined line such as
+`estimated requests: 22 (6 probe + 16 consistency)`.
+
+### Usage linearity vs repetition
+
+Three plain unit texts are measured at repetition counts
+`k = 1, 2, 3, 5, 8`: an ASCII sentence, a CJK-Japanese mix and an emoji
+sequence. The text for `k` is the unit text joined into `k` newline-separated
+repetitions and is measured on the same path as the control. `delta =
+tokens(text_k) - tokens(control)`, with the control measured once.
+For each unit, `statistics.linear_regression(k_values, deltas)` fits the
+repetition series. The report records the k list, the deltas, `slope`,
+`intercept`, `max_residual` (`max |delta - (slope*k + intercept)|`),
+`monotonic_increasing` (deltas strictly increasing at every step) and the
+residual tolerance `max(2, ceil(0.08 * max(deltas)))`. A unit is flagged
+`usage_suspect` when its series is constant, its slope is `<= 0`, the
+deltas are not strictly increasing, or the max residual exceeds the
+tolerance; the reason string names the triggers. A route whose reported
+usage scales with repetition count is at least self-consistent on this
+axis; a flat, decreasing or noisy non-increasing series means the numbers
+are not a linear function of input size, which forged or rounded counters
+often are not. This `k` is a repetition count, unrelated to the
+`quantization_k` ladder of the usage-unit consistency check above.
+
+### Determinism
+
+The same unit text is sent twice and the two input-side token counts are
+compared exactly. A difference is recorded (`deterministic: false`) and a
+note is appended; it never changes a verdict (R1).
+
+### Streaming (`--stream`)
+
+The same unit text is sent once non-streaming and once with
+`"stream": true`. The SSE body is parsed line by line: only lines
+starting with `data:` are considered, `[DONE]` is ignored, and the final
+JSON object carrying `usage` wins. The input-side token count from the
+stream is compared with the non-streaming value; a mismatch is noted, not
+verdicted. If the route rejects streaming or answers without a usable
+usage block, `agree` is null and the note records `stream unavailable`
+(R1).
+
+### Side evidence
+
+Headers on the first consistency response are recorded (`Server`, `Via`,
+`X-Request-Id`), together with the model id the server echoes in the
+response body versus the model that was requested (`model_matches`,
+case-insensitive). A differing echo is recorded as a side-evidence note
+only (R1); side evidence alone never changes a verdict. Headers pass
+through the same budget-counted responses as everything else.
+
 ## The fingerprint-degradation caveat (arXiv 2508.19843)
 
 The SoK on LLM copyright auditing via fingerprinting introduces LeaFBench

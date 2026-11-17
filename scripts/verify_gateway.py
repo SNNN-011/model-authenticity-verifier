@@ -9,6 +9,7 @@ import io
 import json
 import math
 import os
+import statistics
 import sys
 import tempfile
 import threading
@@ -38,6 +39,15 @@ PROBES = [
     ("T4 cjk+emoji+math", "\u6df7\u5408\u4e2d\u6587\u3001\u65e5\u672c\u8a9e\u3068emoji \U0001F30C\U0001F680 \u3068\u8a08\u7b97: 17\u00d723=391\u3001128\u00f74=32"),
     ("T5 arab+misc", "\u0645\u0631\u062d\u0628\u0627 \u0628\u0627\u0644\u0639\u0627\u0644\u0645 \u0661\u0662\u0663 \u03a9\u22483.14 \u2211(x_i) \u2014 na\u00efve caf\u00e9"),
 ]
+
+# Consistency suite (Phase 2b): usage-linearity vs repetition, determinism,
+# streaming and side evidence. Notes only; never feeds the verdict (R1).
+CONSISTENCY_UNITS = [
+    ("ascii", "the quick brown fox jumps over the lazy dog"),
+    ("cjk", "混合中文、日本語と計算のテスト"),
+    ("emoji", "🚀🌌🔡🚀🌌🔡"),
+]
+LINEARITY_K = (1, 2, 3, 5, 8)
 
 # Baseline loading (fail closed). Active baselines live in baselines/*.json and
 # carry a probe_set_id computed from PROBES below; changing one byte of the
@@ -647,7 +657,7 @@ def pause(seconds):
         time.sleep(seconds)
 
 
-def post_json(url, payload, key, timeout):
+def post_json(url, payload, key, timeout, return_headers=False):
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         url,
@@ -663,7 +673,59 @@ def post_json(url, payload, key, timeout):
     )
     opener = urllib.request.build_opener(SafeRedirectHandler())
     with opener.open(req, timeout=timeout) as resp:
-        return resp.status, json.loads(resp.read().decode("utf-8", errors="replace"))
+        body = json.loads(resp.read().decode("utf-8", errors="replace"))
+        if return_headers:
+            return resp.status, body, dict(resp.headers.items())
+        return resp.status, body
+
+
+def post_stream_json(url, payload, key, timeout):
+    """POST with stream requested; parse the SSE body.
+
+    Lines starting with "data:" are JSON objects; the final object carrying
+    "usage" wins. "[DONE]" and unparsable lines are ignored. Returns
+    (status, usage_tokens or None, headers). Raises HTTPError on a >= 400
+    response so the caller can treat streaming as unavailable.
+    """
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": "Bearer " + key,
+            "x-api-key": key,
+            "anthropic-version": "2023-06-01",
+            "Accept": "text/event-stream",
+            "User-Agent": USER_AGENT,
+        },
+        method="POST",
+    )
+    opener = urllib.request.build_opener(SafeRedirectHandler())
+    with opener.open(req, timeout=timeout) as resp:
+        raw = resp.read().decode("utf-8", errors="replace")
+        headers = dict(resp.headers.items())
+        status = resp.status
+    usage_tokens = None
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line.startswith("data:"):
+            continue
+        chunk = line[len("data:"):].strip()
+        if chunk == "[DONE]":
+            continue
+        try:
+            obj = json.loads(chunk)
+        except ValueError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        usage = obj.get("usage")
+        if isinstance(usage, dict):
+            tok = parse_usage_tokens({"usage": usage})
+            if tok is not None:
+                usage_tokens = tok
+    return status, usage_tokens, headers
 
 
 def probe_once(base, model, key, text, dialect_holder, timeout, attempts=3, budget=None):
@@ -712,6 +774,318 @@ def probe_once(base, model, key, text, dialect_holder, timeout, attempts=3, budg
     if switched:
         return probe_once(base, model, key, text, dialect_holder, timeout, attempts, budget)
     raise ProbeFailure(last)
+
+
+def _header(headers, name):
+    if not headers:
+        return None
+    lowered = {str(k).lower(): v for k, v in headers.items()}
+    return lowered.get(name.lower())
+
+
+def _consistency_request(base, model, key, text, dialect_holder, timeout, budget,
+                         stream=False, return_headers=False):
+    """One consistency-suite request. 404/405 on the OpenAI path switches the
+    holder to the Anthropic dialect, mirroring probe_once. No ladder, no
+    retries: the suite is a measurement, not a rescue."""
+    for attempt_dialect in range(2):
+        path = "/chat/completions" if dialect_holder[0] == "openai" else "/messages"
+        url = base.rstrip("/") + path
+        body = {"model": model, "messages": [{"role": "user", "content": text}],
+                "max_tokens": MAX_TOKENS_LADDER[0], "stream": bool(stream)}
+        budget.acquire()
+        try:
+            if stream:
+                status, usage_tokens, headers = post_stream_json(url, body, key, timeout)
+                return {"status": status, "body": None, "usage_tokens": usage_tokens,
+                        "headers": headers}
+            if return_headers:
+                status, resp_body, headers = post_json(url, body, key, timeout,
+                                                       return_headers=True)
+                return {"status": status, "body": resp_body,
+                        "usage_tokens": parse_usage_tokens(resp_body), "headers": headers}
+            status, resp_body = post_json(url, body, key, timeout)
+            return {"status": status, "body": resp_body,
+                    "usage_tokens": parse_usage_tokens(resp_body), "headers": None}
+        except urllib.error.HTTPError as e:
+            if e.code in (404, 405) and dialect_holder[0] == "openai" and attempt_dialect == 0:
+                dialect_holder[0] = "anthropic"
+                continue
+            raise ProbeFailure("endpoint returned HTTP %d" % e.code)
+        except ProbeFailure:
+            raise
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError) as e:
+            raise ProbeFailure("endpoint did not answer (%s)" % type(e).__name__)
+    raise ProbeFailure("endpoint did not answer")
+
+
+def _budget_note(suite, budget, err=None):
+    if budget.exceeded:
+        suite["notes"].append("consistency incomplete: request budget exhausted")
+    else:
+        suite["notes"].append("consistency unavailable: %s" % (err or "unknown error"))
+
+
+def run_consistency_suite(base, model, key, dialect_holder, timeout, sleep, budget,
+                          stream=False):
+    """Consistency suite. Notes only: results are appended to the report and
+    printed, never used to pick or change a verdict (R1). Every HTTP attempt
+    passes through the shared RequestBudget."""
+    suite = {"linearity": {}, "determinism": {}, "side_evidence": {}, "notes": []}
+    if stream:
+        suite["stream"] = {}
+
+    # --- control once, same path as everything else; headers ride on this one ---
+    try:
+        ctrl = _consistency_request(base, model, key, CONTROL_TEXT, dialect_holder,
+                                    timeout, budget, return_headers=True)
+    except ProbeFailure as e:
+        _budget_note(suite, budget, e)
+        return suite
+    control_tokens = ctrl["usage_tokens"]
+    if control_tokens is None:
+        suite["notes"].append("consistency: control response carried no token usage; the consistency suite could not run")
+        return suite
+
+    # --- side evidence: headers on the first consistency response + model echo ---
+    ctrl_body = ctrl["body"] if isinstance(ctrl.get("body"), dict) else {}
+    echo = ctrl_body.get("model")
+    if not isinstance(echo, str):
+        echo = None
+    if echo is None:
+        model_matches = None
+    else:
+        model_matches = echo.strip().lower() == (model or "").strip().lower()
+    headers = ctrl.get("headers") or {}
+    suite["side_evidence"] = {
+        "model_requested": model,
+        "model_echo": echo,
+        "model_matches": model_matches,
+        "server": _header(headers, "Server"),
+        "via": _header(headers, "Via"),
+        "x_request_id": _header(headers, "X-Request-Id"),
+    }
+    if echo is not None and model_matches is False:
+        suite["notes"].append("server echoed model %s while %s was requested; recorded as side evidence only, the verdict is unchanged (R1)" % (echo, model))
+    pause(sleep)
+
+    # --- linearity of usage vs text repetition ---
+    for unit_name, unit_text in CONSISTENCY_UNITS:
+        ks = list(LINEARITY_K)
+        deltas = []
+        unit_ok = True
+        for k in ks:
+            text = "\n".join([unit_text] * k)
+            try:
+                resp = _consistency_request(base, model, key, text, dialect_holder,
+                                            timeout, budget)
+            except ProbeFailure as e:
+                _budget_note(suite, budget, e)
+                return suite
+            tok = resp["usage_tokens"]
+            if tok is None:
+                suite["notes"].append("consistency: response carried no token usage (unit %s, k=%d); the linearity check was skipped for this unit" % (unit_name, k))
+                unit_ok = False
+                break
+            deltas.append(tok - control_tokens)
+            pause(sleep)
+        if not unit_ok:
+            continue
+        slope, intercept = statistics.linear_regression(ks, deltas)
+        max_residual = max(abs(d - (slope * k + intercept)) for k, d in zip(ks, deltas))
+        monotonic = all(deltas[i] < deltas[i + 1] for i in range(len(deltas) - 1))
+        tol = tolerance(max(deltas))
+        reasons = []
+        if len(set(deltas)) == 1:
+            reasons.append("constant series (slope %.3f)" % slope)
+        if slope <= 0:
+            reasons.append("slope <= 0 (%.3f)" % slope)
+        if not monotonic:
+            reasons.append("deltas are not strictly increasing")
+        if max_residual > tol:
+            reasons.append("max residual %.3f exceeds tolerance %d" % (max_residual, tol))
+        usage_suspect = bool(reasons)
+        reason = "; ".join(reasons) if reasons else "slope and residuals within tolerance"
+        suite["linearity"][unit_name] = {
+            "k": ks,
+            "deltas": deltas,
+            "slope": slope,
+            "intercept": intercept,
+            "max_residual": max_residual,
+            "monotonic_increasing": monotonic,
+            "tolerance": tol,
+            "usage_suspect": usage_suspect,
+            "reason": reason,
+        }
+
+    # --- determinism: the same unit text twice, exact comparison ---
+    det_unit, det_text = CONSISTENCY_UNITS[0]
+    det_tokens = []
+    det_ok = True
+    for _ in range(2):
+        try:
+            resp = _consistency_request(base, model, key, det_text, dialect_holder,
+                                        timeout, budget)
+        except ProbeFailure as e:
+            _budget_note(suite, budget, e)
+            return suite
+        tok = resp["usage_tokens"]
+        if tok is None:
+            suite["notes"].append("consistency: response carried no token usage (determinism, unit %s); the determinism check was skipped" % det_unit)
+            det_ok = False
+            break
+        det_tokens.append(tok)
+        pause(sleep)
+    if det_ok:
+        deterministic = det_tokens[0] == det_tokens[1]
+        suite["determinism"] = {"unit": det_unit, "tokens": det_tokens,
+                                "deterministic": deterministic}
+        if deterministic is False:
+            suite["notes"].append("determinism check: repeated identical text returned different input token counts (%d vs %d); recorded as a note only, the verdict is unchanged (R1)" % (det_tokens[0], det_tokens[1]))
+
+    # --- streaming vs non-streaming, only when --stream is set ---
+    if stream:
+        stream_text = CONSISTENCY_UNITS[0][1]
+        stream_result = {"non_stream_tokens": None, "stream_tokens": None,
+                         "agree": None, "note": "stream unavailable"}
+        try:
+            resp = _consistency_request(base, model, key, stream_text, dialect_holder,
+                                        timeout, budget, stream=False)
+            ns_tokens = resp["usage_tokens"]
+        except ProbeFailure as e:
+            if budget.exceeded:
+                _budget_note(suite, budget, e)
+                suite["stream"] = stream_result
+                return suite
+            ns_tokens = None
+        if ns_tokens is None:
+            stream_result["note"] = "stream unavailable"
+        else:
+            stream_result["non_stream_tokens"] = ns_tokens
+            pause(sleep)
+            try:
+                resp = _consistency_request(base, model, key, stream_text, dialect_holder,
+                                            timeout, budget, stream=True)
+                st_tokens = resp["usage_tokens"]
+            except ProbeFailure as e:
+                if budget.exceeded:
+                    _budget_note(suite, budget, e)
+                    suite["stream"] = stream_result
+                    return suite
+                st_tokens = None
+            if st_tokens is None:
+                stream_result["note"] = "stream unavailable"
+            else:
+                stream_result["stream_tokens"] = st_tokens
+                agree = ns_tokens == st_tokens
+                stream_result["agree"] = agree
+                if agree:
+                    stream_result["note"] = "usage agrees"
+                else:
+                    stream_result["note"] = ("stream usage differs from non-streaming (%d vs %d); "
+                                             "recorded as a note only, the verdict is unchanged (R1)" % (ns_tokens, st_tokens))
+                    suite["notes"].append("stream check: %s" % stream_result["note"])
+        if stream_result["agree"] is None and "stream unavailable" == stream_result["note"]:
+            suite["notes"].append("stream unavailable: the route did not answer a streaming request with a usable usage block; recorded as a note only (R1)")
+        suite["stream"] = stream_result
+    return suite
+
+
+def print_consistency_block(suite):
+    print("consistency:")
+    for unit_name in (u for u, _ in CONSISTENCY_UNITS):
+        entry = suite.get("linearity", {}).get(unit_name)
+        if not entry:
+            continue
+        print("  linearity %s: k=%s slope=%.3f intercept=%.3f max_residual=%.3f tolerance=%d monotonic=%s usage_suspect=%s (%s)" % (
+            unit_name, ",".join(str(k) for k in entry["k"]), entry["slope"],
+            entry["intercept"], entry["max_residual"], entry["tolerance"],
+            entry["monotonic_increasing"], entry["usage_suspect"], entry["reason"]))
+    det = suite.get("determinism") or {}
+    if det:
+        tokens = det.get("tokens") or []
+        print("  determinism: unit=%s tokens=%s deterministic=%s" % (
+            det.get("unit"), ",".join(str(t) for t in tokens), det.get("deterministic")))
+    st = suite.get("stream")
+    if st is not None:
+        print("  stream: non_stream_tokens=%s stream_tokens=%s agree=%s note=%s" % (
+            st.get("non_stream_tokens"), st.get("stream_tokens"),
+            st.get("agree"), st.get("note")))
+    se = suite.get("side_evidence") or {}
+    if se:
+        print("  side_evidence: model_requested=%s model_echo=%s model_matches=%s server=%s via=%s x_request_id=%s" % (
+            se.get("model_requested"), se.get("model_echo"), se.get("model_matches"),
+            se.get("server"), se.get("via"), se.get("x_request_id")))
+    for note in suite.get("notes", []):
+        print("  note: %s" % note)
+
+
+CONSISTENCY_ESTIMATE_LINE = ("estimated consistency requests: 16 "
+                             "(1 control + 3 units x 5 k values; plus 2 determinism, "
+                             "plus 2 when --stream, plus 0 for headers because they ride "
+                             "on existing responses)")
+
+
+def run_consistency(args, api_key=None):
+    if not args.base or not args.model:
+        print("error: --base and --model are required", file=sys.stderr)
+        return 1
+    if api_key is None:
+        key, key_error = read_key(args)
+        if key_error:
+            print("error: %s" % key_error, file=sys.stderr)
+            return 1
+    else:
+        key = api_key
+    if args.timeout <= 0:
+        print("error: --timeout must be > 0", file=sys.stderr)
+        return 1
+    if args.sleep < 0:
+        print("error: --sleep must be >= 0", file=sys.stderr)
+        return 1
+    if getattr(args, "max_requests", 0) is None or getattr(args, "max_requests", 0) < 0:
+        print("error: --max-requests must be >= 0", file=sys.stderr)
+        return 1
+    stream = bool(getattr(args, "stream", False))
+    print(CONSISTENCY_ESTIMATE_LINE)
+    max_requests = getattr(args, "max_requests", 0) or 0
+    if max_requests:
+        print("request limit: %d" % max_requests)
+        if 16 > max_requests:
+            print("warning: the estimate exceeds --max-requests; the suite will stop and note that the request budget was exhausted")
+    budget = RequestBudget(max_requests)
+    dialect_holder = ["openai"]
+    suite = run_consistency_suite(args.base, args.model, key, dialect_holder,
+                                  args.timeout, args.sleep, budget, stream=stream)
+    print("base: %s" % args.base)
+    print("model: %s" % args.model)
+    print("dialect: %s" % dialect_holder[0])
+    print_consistency_block(suite)
+    report = {
+        "tool": TOOL,
+        "version": VERSION,
+        "mode": "consistency",
+        "base": args.base,
+        "model": args.model,
+        "started": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "dialect": dialect_holder[0],
+        "consistency": suite,
+        "budget": {
+            "estimated": 16,
+            "limit": budget.limit,
+            "used": budget.used,
+            "exceeded": bool(budget.exceeded),
+        },
+    }
+    if args.out:
+        try:
+            with open(args.out, "w", encoding="utf-8") as fh:
+                json.dump(report, fh, ensure_ascii=False, indent=2)
+            print("report written to %s" % args.out)
+        except OSError as e:
+            print("error: cannot write --out file: %s" % e, file=sys.stderr)
+            return 1
+    return 0
 
 
 def build_report(base, model, dialect, control_tokens_list, probe_results, family,
@@ -829,6 +1203,9 @@ def run(args, api_key=None):
     estimated = estimate_run_requests(n_texts, args.repeat)
     print("estimated requests: %d (control + %d texts, repeat %d; retries and the max_tokens ladder can add more)" % (
         estimated, n_texts, args.repeat))
+    with_consistency = bool(getattr(args, "with_consistency", False))
+    if with_consistency:
+        print("estimated requests: %d (%d probe + 16 consistency)" % (estimated + 16, estimated))
     max_requests = getattr(args, "max_requests", 0) or 0
     if max_requests:
         print("request limit: %d" % max_requests)
@@ -900,6 +1277,18 @@ def run(args, api_key=None):
     control_unstable = (args.repeat > 1 and len(control_tokens_all) > 1 and is_unstable(control_tokens_all))
     consistency = usage_consistency(control_units_by_rep, probe_units_by_name,
                                     control_cache_by_rep, probe_cache_by_name)
+    consistency_suite = None
+    if with_consistency:
+        consistency_suite = run_consistency_suite(
+            args.base, args.model, key, dialect_holder,
+            args.timeout, args.sleep, budget, stream=bool(getattr(args, "stream", False)))
+        dialect = dialect_holder[0]
+        consistency["linearity"] = consistency_suite["linearity"]
+        consistency["determinism"] = consistency_suite["determinism"]
+        if "stream" in consistency_suite:
+            consistency["stream"] = consistency_suite["stream"]
+        consistency["side_evidence"] = consistency_suite["side_evidence"]
+        consistency["notes"] = consistency_suite["notes"]
 
     probe_results = []
     matches = None
@@ -1013,11 +1402,12 @@ def run(args, api_key=None):
                 note += "; control %d is outside the recorded control range [%d,%d] for %s; recorded as a note only, the verdict is unchanged (R2)" % (
                     first_control, cr[0], cr[1], baseline["family"])
 
+    report_estimated = estimated + (16 if with_consistency else 0)
     report = build_report(args.base, args.model, dialect, control_tokens_all,
                           probe_results, family, signature,
                           matches, verdict, note, failed_probes,
                           total_texts=n_texts, unstable_texts=unstable_texts,
-                          budget=budget, estimated_requests=estimated,
+                          budget=budget, estimated_requests=report_estimated,
                           baseline=baseline, control_units=control_units_by_rep,
                           consistency=consistency)
 
@@ -1046,6 +1436,8 @@ def run(args, api_key=None):
         print("not measured: %s" % f)
     print("verdict: %s" % verdict)
     print("note: %s" % note)
+    if consistency_suite is not None:
+        print_consistency_block(consistency_suite)
 
     if args.out:
         try:
@@ -1092,6 +1484,22 @@ def main():
         return 1
     if argv and argv[0] == "selftest":
         return selftest()
+    if argv and argv[0] == "consistency":
+        consistency_parser = VerifierArgumentParser(
+            prog="verify_gateway.py consistency",
+            description="Run only the consistency suite (usage linearity vs repetition, determinism, side evidence; --stream adds the streaming check). Notes only; the family verdict is untouched.")
+        consistency_parser.add_argument("--base", help="base URL of the gateway, e.g. https://gw.example.com/v1")
+        consistency_parser.add_argument("--model", help="model id to check, e.g. anthropic/claude-opus-4.8")
+        consistency_parser.add_argument("--key-stdin", action="store_true",
+                                        help="read the API key from one line on stdin; env VERIFY_API_KEY is the other option")
+        consistency_parser.add_argument("--sleep", type=float, default=2, help="seconds between requests (default 2)")
+        consistency_parser.add_argument("--timeout", type=float, default=60, help="per-request timeout in seconds (default 60)")
+        consistency_parser.add_argument("--max-requests", type=int, default=0,
+                                        help="stop after N HTTP requests (default 0 = unlimited)")
+        consistency_parser.add_argument("--out", help="write the full JSON report to FILE")
+        consistency_parser.add_argument("--stream", action="store_true",
+                                        help="also send the unit text once non-streaming and once with stream true, and compare usage")
+        return run_consistency(consistency_parser.parse_args(argv[1:]))
 
     parser = VerifierArgumentParser(
         description="Model-authenticity verifier: input-side tokenizer diff against measured family signatures.")
@@ -1106,6 +1514,10 @@ def main():
                         help="stop after N HTTP requests and report PROBE INCOMPLETE (default 0 = unlimited)")
     parser.add_argument("--out", help="write the full JSON report to FILE")
     parser.add_argument("--texts", help="alternate text set, one text per line, 'name=content' allowed")
+    parser.add_argument("--with-consistency", action="store_true",
+                        help="after the probe run, also run the consistency suite and report it (notes only, the family verdict is unchanged)")
+    parser.add_argument("--stream", action="store_true",
+                        help="with --with-consistency, also check streaming vs non-streaming usage")
     args = parser.parse_args()
     return run(args)
 
@@ -1492,6 +1904,23 @@ def selftest():
         def base_token(text):
             if scenario == "constant":
                 return 42
+            unit_text_map = {}
+            for uname, utext in CONSISTENCY_UNITS:
+                for k in LINEARITY_K:
+                    unit_text_map["\n".join([utext] * k)] = (uname, k)
+            if text in unit_text_map:
+                uname, k = unit_text_map[text]
+                if scenario == "linear_honest":
+                    return 5 + k * {"ascii": 3, "cjk": 2, "emoji": 4}[uname]
+                if scenario == "linear_constant":
+                    return 30
+                if scenario == "linear_quadratic":
+                    return 5 + 4 * k + 3 * k * k
+                if scenario == "nondeterministic":
+                    if text == CONSISTENCY_UNITS[0][1]:
+                        state["counts"][text] = state["counts"].get(text, 0) + 1
+                        return 10 + (state["counts"][text] % 2) * 2
+                    return 5 + k * 3
             if text == CONTROL_TEXT:
                 if scenario == "drifting_control":
                     state["control"] += 1
@@ -1517,14 +1946,37 @@ def selftest():
             def log_message(self, *args):
                 pass
 
-            def send_json(self, code, obj):
+            def send_json(self, code, obj, extra_headers=None):
                 raw = json.dumps(obj).encode("utf-8")
                 try:
                     self.send_response(code)
                     self.send_header("Content-Type", "application/json")
+                    for name, value in (extra_headers or {}).items():
+                        self.send_header(name, value)
                     self.send_header("Content-Length", str(len(raw)))
                     self.end_headers()
                     self.wfile.write(raw)
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+                    pass
+
+            def send_sse(self, model, usage):
+                chunks = [
+                    {"choices": [{"delta": {"role": "assistant", "content": "ok"}}]},
+                    {"choices": [], "usage": usage},
+                ]
+                raw = "".join("data: %s\n\n" % json.dumps(c) for c in chunks)
+                raw += "data: [DONE]\n\n"
+                payload = raw.encode("utf-8")
+                try:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream")
+                    if scenario == "side_evidence":
+                        self.send_header("Server", "mock-gateway")
+                        self.send_header("Via", "1.1 mock-proxy")
+                        self.send_header("X-Request-Id", "req-side-0001")
+                    self.send_header("Content-Length", str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
                 except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
                     pass
 
@@ -1554,9 +2006,25 @@ def selftest():
                     text = payload["messages"][0]["content"]
                 except Exception:
                     text = ""
+                echo_model = payload.get("model", "mock-model")
+                if scenario == "side_evidence":
+                    echo_model = "mock/echoed-other-model"
+                if scenario != "no_usage" and payload.get("stream"):
+                    if scenario == "stream_unavailable":
+                        self.send_json(400, {"error": "streaming not supported"})
+                        return
+                    usage_tokens = base_token(text)
+                    if scenario == "stream_diff":
+                        usage_tokens += 3
+                    if self.path.endswith("/messages"):
+                        usage = {"input_tokens": usage_tokens}
+                    else:
+                        usage = {"prompt_tokens": usage_tokens}
+                    self.send_sse(echo_model, usage)
+                    return
                 token = base_token(text)
                 body = {
-                    "model": payload.get("model", "mock-model"),
+                    "model": echo_model,
                     "choices": [{"message": {"role": "assistant", "content": "ok"}}],
                 }
                 if scenario != "no_usage":
@@ -1571,6 +2039,13 @@ def selftest():
                     base_t = usage.get("prompt_tokens", usage.get("input_tokens"))
                     usage["total_tokens"] = base_t + 7
                     usage["completion_tokens"] = 0
+                if scenario == "side_evidence":
+                    self.send_json(200, body, extra_headers={
+                        "Server": "mock-gateway",
+                        "Via": "1.1 mock-proxy",
+                        "X-Request-Id": "req-side-0001",
+                    })
+                    return
                 self.send_json(200, body)
 
         server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
@@ -1594,6 +2069,8 @@ def selftest():
             "max_requests": 0,
             "out": None,
             "texts": None,
+            "with_consistency": False,
+            "stream": False,
         }
         defaults.update(overrides)
         return argparse.Namespace(**defaults)
@@ -1730,9 +2207,9 @@ def selftest():
         calls = {"n": 0}
         real_post = post_json
 
-        def counting_post(url, payload, key, timeout):
+        def counting_post(url, payload, key, timeout, **kwargs):
             calls["n"] += 1
-            return real_post(url, payload, key, timeout)
+            return real_post(url, payload, key, timeout, **kwargs)
 
         globals()["post_json"] = counting_post
         try:
@@ -1754,9 +2231,9 @@ def selftest():
     def estimate_before_first_request():
         real_post = post_json
 
-        def sentinel_post(url, payload, key, timeout):
+        def sentinel_post(url, payload, key, timeout, **kwargs):
             print("__mock_request__")
-            return real_post(url, payload, key, timeout)
+            return real_post(url, payload, key, timeout, **kwargs)
 
         globals()["post_json"] = sentinel_post
         try:
@@ -1979,12 +2456,229 @@ def selftest():
         and "control 5 is outside the recorded control range [99,99] for deepseek" in out
         and "the verdict is unchanged (R2)" in out))
 
+    # --- consistency suite (Phase 2b) ---
+    def consistency_scenario_report(scenario, **overrides):
+        server, base = start_gateway(scenario)
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                target = os.path.join(tmpdir, "report.json")
+                opts = dict(overrides)
+                opts["out"] = target
+                code, out = run_capture(args_for(base, with_consistency=True, **opts))
+                with open(target, "r", encoding="utf-8") as fh:
+                    return code, out, json.load(fh)
+        finally:
+            stop_gateway(server)
+
+    def consistency_main_capture(argv):
+        old = sys.argv
+        old_env = os.environ.get("VERIFY_API_KEY")
+        sys.argv = ["verify_gateway.py"] + argv
+        os.environ["VERIFY_API_KEY"] = "selftest-key"
+        out = io.StringIO()
+        err = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                try:
+                    code = main()
+                except SystemExit as e:
+                    code = e.code if isinstance(e.code, int) else 1
+        finally:
+            sys.argv = old
+            if old_env is None:
+                os.environ.pop("VERIFY_API_KEY", None)
+            else:
+                os.environ["VERIFY_API_KEY"] = old_env
+        return code, out.getvalue() + err.getvalue()
+
+    code_lh, out_lh, rep_lh = consistency_scenario_report("linear_honest")
+    lin_lh = rep_lh["consistency"]["linearity"]
+    check("linear_honest keeps the family verdict", lambda: (
+        "verdict: SIGNATURE MATCH" in out_lh and "consistency:" in out_lh))
+    check("linear_honest slopes equal the per-unit rates", lambda: (
+        abs(lin_lh["ascii"]["slope"] - 3.0) < 1e-9
+        and abs(lin_lh["cjk"]["slope"] - 2.0) < 1e-9
+        and abs(lin_lh["emoji"]["slope"] - 4.0) < 1e-9))
+    check("linear_honest residuals are zero and not suspect", lambda: all(
+        abs(lin_lh[u]["max_residual"]) < 1e-9
+        and lin_lh[u]["monotonic_increasing"] is True
+        and lin_lh[u]["usage_suspect"] is False
+        for u in ("ascii", "cjk", "emoji")))
+    check("linear_honest determinism recorded and true", lambda: (
+        rep_lh["consistency"]["determinism"]["deterministic"] is True
+        and rep_lh["consistency"]["determinism"]["tokens"][0] == rep_lh["consistency"]["determinism"]["tokens"][1]))
+
+    code_lc, out_lc, rep_lc = consistency_scenario_report("linear_constant")
+    lin_lc = rep_lc["consistency"]["linearity"]
+    check("linear_constant slope is zero and usage_suspect with a constant/slope reason", lambda: all(
+        abs(lin_lc[u]["slope"]) < 1e-9
+        and lin_lc[u]["usage_suspect"] is True
+        and ("constant" in lin_lc[u]["reason"] or "slope" in lin_lc[u]["reason"])
+        for u in ("ascii", "cjk", "emoji")))
+
+    code_lq, out_lq, rep_lq = consistency_scenario_report("linear_quadratic")
+    lin_lq = rep_lq["consistency"]["linearity"]
+    check("linear_quadratic residual exceeds tolerance and usage_suspect is set", lambda: all(
+        lin_lq[u]["max_residual"] > lin_lq[u]["tolerance"]
+        and lin_lq[u]["usage_suspect"] is True
+        for u in ("ascii", "cjk", "emoji")))
+    check("linear_quadratic stays strictly increasing", lambda: all(
+        lin_lq[u]["monotonic_increasing"] is True for u in ("ascii", "cjk", "emoji")))
+
+    code_nd, out_nd, rep_nd = consistency_scenario_report("nondeterministic")
+    check("nondeterministic repeats are recorded and flagged", lambda: (
+        rep_nd["consistency"]["determinism"]["deterministic"] is False
+        and "determinism check" in out_nd))
+
+    code_so, out_so, rep_so = consistency_scenario_report("stream_ok", stream=True)
+    check("stream_ok agrees with non-streaming usage", lambda: (
+        rep_so["consistency"]["stream"]["agree"] is True
+        and rep_so["consistency"]["stream"]["non_stream_tokens"]
+        == rep_so["consistency"]["stream"]["stream_tokens"]))
+    code_sd, out_sd, rep_sd = consistency_scenario_report("stream_diff", stream=True)
+    check("stream_diff disagrees with non-streaming usage", lambda: (
+        rep_sd["consistency"]["stream"]["agree"] is False
+        and rep_sd["consistency"]["stream"]["stream_tokens"]
+        == rep_sd["consistency"]["stream"]["non_stream_tokens"] + 3))
+    code_su, out_su, rep_su = consistency_scenario_report("stream_unavailable", stream=True)
+    check("stream_unavailable records agree=None and a note", lambda: (
+        rep_su["consistency"]["stream"]["agree"] is None
+        and "stream unavailable" in rep_su["consistency"]["stream"]["note"]
+        and any("stream unavailable" in n for n in rep_su["consistency"]["notes"])))
+    check("stream block absent without --stream", lambda: "stream" not in rep_lh["consistency"])
+
+    code_se, out_se, rep_se = consistency_scenario_report("side_evidence")
+    se = rep_se["consistency"]["side_evidence"]
+    check("side evidence captured (headers and model echo)", lambda: (
+        se["server"] == "mock-gateway" and se["via"] == "1.1 mock-proxy"
+        and se["x_request_id"] == "req-side-0001"
+        and se["model_requested"] == "deepseek/deepseek-v4.1-flash-1017"
+        and se["model_echo"] == "mock/echoed-other-model"
+        and se["model_matches"] is False))
+    check("side evidence verdict line identical to the honest run", lambda: (
+        verdict_line(out_se) == verdict_line(out_h)))
+    check("side evidence note recorded as side evidence only", lambda: (
+        "server echoed model mock/echoed-other-model" in out_se
+        and "side evidence only" in out_se))
+
+    code_h3, out_h3 = scenario_run("honest")
+    check("--with-consistency verdict line identical to the plain run", lambda: (
+        verdict_line(out_lh) == verdict_line(out_h3)))
+    check("--with-consistency prints the combined estimate line", lambda: (
+        "estimated requests: 22 (6 probe + 16 consistency)" in out_lh))
+    check("--with-consistency prints a consistency block after the verdict", lambda: (
+        "consistency:" in out_lh and out_lh.find("verdict:") < out_lh.find("consistency:")))
+    check("--with-consistency report carries the consistency keys", lambda: all(
+        k in rep_lh["consistency"] for k in ("linearity", "determinism", "side_evidence", "notes")))
+
+    def consistency_estimate_before_first_request():
+        real_post = post_json
+
+        def sentinel_post(url, payload, key, timeout, **kwargs):
+            print("__mock_request__")
+            return real_post(url, payload, key, timeout, **kwargs)
+
+        server, base = start_gateway("honest")
+        globals()["post_json"] = sentinel_post
+        try:
+            code, out = consistency_main_capture(
+                ["consistency", "--base", base, "--model", "deepseek/deepseek-v4.1-flash-1017",
+                 "--sleep", "0", "--timeout", "5"])
+        finally:
+            globals()["post_json"] = real_post
+            stop_gateway(server)
+        est = out.find("estimated consistency requests: 16")
+        first = out.find("__mock_request__")
+        return est != -1 and first != -1 and est < first
+
+    check("consistency-only estimate line printed before the first request", consistency_estimate_before_first_request)
+
+    def consistency_budget_counter():
+        calls = {"n": 0}
+        real_post = post_json
+
+        def counting_post(url, payload, key, timeout, **kwargs):
+            calls["n"] += 1
+            return real_post(url, payload, key, timeout, **kwargs)
+
+        server, base = start_gateway("honest")
+        globals()["post_json"] = counting_post
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                target = os.path.join(tmpdir, "report.json")
+                code, out = consistency_main_capture(
+                    ["consistency", "--base", base, "--model", "deepseek/deepseek-v4.1-flash-1017",
+                     "--sleep", "0", "--timeout", "5", "--out", target])
+                with open(target, "r", encoding="utf-8") as fh:
+                    report = json.load(fh)
+        finally:
+            globals()["post_json"] = real_post
+            stop_gateway(server)
+        return calls["n"], report["budget"]["used"], code
+
+    c_calls, c_used, c_code = consistency_budget_counter()
+    check("consistency-only: counter equals report budget.used", lambda: c_calls == c_used and c_code == 0)
+
+    def consistency_budget_stops_at_three():
+        calls = {"n": 0}
+        real_post = post_json
+
+        def counting_post(url, payload, key, timeout, **kwargs):
+            calls["n"] += 1
+            return real_post(url, payload, key, timeout, **kwargs)
+
+        server, base = start_gateway("honest")
+        globals()["post_json"] = counting_post
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                target = os.path.join(tmpdir, "report.json")
+                code, out = consistency_main_capture(
+                    ["consistency", "--base", base, "--model", "deepseek/deepseek-v4.1-flash-1017",
+                     "--sleep", "0", "--timeout", "5", "--max-requests", "3", "--out", target])
+        finally:
+            globals()["post_json"] = real_post
+            stop_gateway(server)
+        return calls["n"], out
+
+    c3_calls, c3_out = consistency_budget_stops_at_three()
+    check("consistency-only: --max-requests 3 stops at exactly 3 requests", lambda: c3_calls == 3)
+    check("consistency-only: budget exhaustion is recorded as a note only", lambda: (
+        "consistency incomplete: request budget exhausted" in c3_out))
+
+    def with_consistency_budget_counter():
+        calls = {"n": 0}
+        real_post = post_json
+
+        def counting_post(url, payload, key, timeout, **kwargs):
+            calls["n"] += 1
+            return real_post(url, payload, key, timeout, **kwargs)
+
+        server, base = start_gateway("honest")
+        globals()["post_json"] = counting_post
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                target = os.path.join(tmpdir, "report.json")
+                run_capture(args_for(base, with_consistency=True, out=target))
+                with open(target, "r", encoding="utf-8") as fh:
+                    report = json.load(fh)
+        finally:
+            globals()["post_json"] = real_post
+            stop_gateway(server)
+        return calls["n"], report["budget"]["used"]
+
+    wc_calls, wc_used = with_consistency_budget_counter()
+    check("--with-consistency: counter equals report budget.used", lambda: wc_calls == wc_used)
+
+    check("consistency --help exits 0", lambda: (
+        consistency_main_capture(["consistency", "--help"])[0] == 0
+        and "usage:" in consistency_main_capture(["consistency", "--help"])[1].lower()))
+
     total = len(results)
     failed = [d for d, ok in results if not ok]
     passed = total - len(failed)
 
-    if total != 198:
-        print("SELFTEST (v3.1): internal error, expected 198 assertions, ran %d" % total, file=sys.stderr)
+    if total != 223:
+        print("SELFTEST (v3.1): internal error, expected 223 assertions, ran %d" % total, file=sys.stderr)
         return 2
     if failed:
         for d in failed:
