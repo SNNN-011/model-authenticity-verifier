@@ -47,6 +47,8 @@ BASELINE_DIR = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__f
 REFERENCE_ONLY_FILE = "_reference_only.json"
 BASELINE_SCHEMA_VERSION = 1
 BASELINE_CAVEAT = "third-party-gateway caveat: a wrapper can re-tokenize locally or forge usage, so this is WEAK evidence for the counting dialect, never the weights (R1)"
+INFERRED_MODEL_CAVEAT = "model ini belum diukur langsung pada text set ini; dipetakan lewat keluarga"
+SINGLE_ROUTE_CAVEAT = "single-route caveat: the signature was measured on a single route, so a route-specific wrapper cannot be ruled out (R1)"
 
 
 class BaselineError(Exception):
@@ -142,9 +144,29 @@ def map_family(model_id):
     return None
 
 
-def _is_int_list(value, length):
-    return (isinstance(value, list) and len(value) == length
-            and all(isinstance(v, int) and not isinstance(v, bool) for v in value))
+def _check_int_list(value, length, label, fname):
+    """Fail-closed integer-list check: rejects a wrong length, booleans,
+    floats, non-integers and negative elements. Error names the file."""
+    if not isinstance(value, list) or len(value) != length:
+        raise BaselineError("%s: %s must be a list of exactly %d integers" % (fname, label, length))
+    for i, v in enumerate(value):
+        if isinstance(v, bool):
+            raise BaselineError("%s: %s[%d] is a boolean; integers only" % (fname, label, i))
+        if isinstance(v, float):
+            raise BaselineError("%s: %s[%d] is a float (%r); integers only" % (fname, label, i, v))
+        if not isinstance(v, int):
+            raise BaselineError("%s: %s[%d] is not an integer (%r)" % (fname, label, i, v))
+        if v < 0:
+            raise BaselineError("%s: %s[%d] is negative (%r)" % (fname, label, i, v))
+    return list(value)
+
+
+def _model_id_matches(requested, candidate):
+    r = (requested or "").strip().lower()
+    c = (candidate or "").strip().lower()
+    if not r:
+        return False
+    return r == c or r.split("/")[-1] == c.split("/")[-1]
 
 
 def _load_json_file(path, fname):
@@ -162,6 +184,9 @@ def _load_json_file(path, fname):
     version = data.get("schema_version")
     if (not isinstance(version, int) or isinstance(version, bool)
             or version != BASELINE_SCHEMA_VERSION):
+        if isinstance(version, int) and not isinstance(version, bool) and version < 0:
+            raise BaselineError("%s: schema_version %d is negative; expected %d" % (
+                fname, version, BASELINE_SCHEMA_VERSION))
         raise BaselineError("%s: unknown schema_version %r (expected %d)" % (
             fname, version, BASELINE_SCHEMA_VERSION))
     return data
@@ -188,8 +213,7 @@ def _validate_reference_only(data, fname):
         if "superseded_signature" in row:
             if row.get("superseded") is not True:
                 raise BaselineError("%s: rows[%d] family %r carries superseded_signature without \"superseded\": true" % (fname, i, family))
-            if not _is_int_list(row["superseded_signature"], len(PROBES)):
-                raise BaselineError("%s: rows[%d] family %r superseded_signature must be a list of %d integers" % (fname, i, family, len(PROBES)))
+            _check_int_list(row["superseded_signature"], len(PROBES), "superseded_signature", fname)
         names.append(family)
     return names
 
@@ -201,8 +225,11 @@ def _validate_active(data, fname):
     sig = data.get("signature")
     cr = data.get("control_range")
     provenance = data.get("provenance")
+    models_measured = data.get("models_measured")
+    models_inferred = data.get("models_inferred")
     for field, value in (("family", family), ("models", models), ("probe_set_id", pid),
-                         ("signature", sig), ("control_range", cr), ("provenance", provenance)):
+                         ("signature", sig), ("control_range", cr), ("provenance", provenance),
+                         ("models_measured", models_measured), ("models_inferred", models_inferred)):
         if value is None:
             raise BaselineError("%s: missing required field %r" % (fname, field))
     if data.get("superseded"):
@@ -216,14 +243,28 @@ def _validate_active(data, fname):
     for m in models:
         if map_family(m) != family:
             raise BaselineError("%s: model %r does not map to family %r via map_family" % (fname, m, family))
+    for field, value in (("models_measured", models_measured), ("models_inferred", models_inferred)):
+        if not isinstance(value, list) or not all(isinstance(m, str) and m.strip() for m in value):
+            raise BaselineError("%s: %r must be a list of non-empty strings" % (fname, field))
+    measured = list(models_measured)
+    inferred = list(models_inferred)
+    if len(set(measured)) != len(measured) or len(set(inferred)) != len(inferred):
+        raise BaselineError("%s: 'models_measured' and 'models_inferred' must not contain duplicates" % fname)
+    if set(measured) & set(inferred):
+        raise BaselineError("%s: 'models_measured' and 'models_inferred' overlap: %s" % (
+            fname, ", ".join(sorted(set(measured) & set(inferred)))))
+    if set(measured) | set(inferred) != set(models):
+        missing = sorted(set(models) - (set(measured) | set(inferred)))
+        extra = sorted((set(measured) | set(inferred)) - set(models))
+        raise BaselineError("%s: 'models_measured' and 'models_inferred' must cover exactly the 'models' list "
+                            "(missing: %s; extra: %s)" % (fname, ", ".join(missing) or "-", ", ".join(extra) or "-"))
+    if not measured:
+        raise BaselineError("%s: 'models_measured' must not be empty; at least one model must be measured on this text set" % fname)
     if pid != probe_set_id():
         raise BaselineError("%s: probe_set_id %r does not match the current probe set %r; "
                             "the baseline is invalidated" % (fname, pid, probe_set_id()))
-    if not _is_int_list(sig, len(PROBES)):
-        raise BaselineError("%s: 'signature' must be a list of exactly %d integers" % (fname, len(PROBES)))
-    if (not isinstance(cr, list) or len(cr) != 2
-            or not all(isinstance(v, int) and not isinstance(v, bool) for v in cr)):
-        raise BaselineError("%s: 'control_range' must be a list of two integers" % fname)
+    sig = _check_int_list(sig, len(PROBES), "'signature'", fname)
+    cr = _check_int_list(cr, 2, "'control_range'", fname)
     if cr[0] > cr[1]:
         raise BaselineError("%s: 'control_range' min %d exceeds max %d" % (fname, cr[0], cr[1]))
     if not isinstance(provenance, dict):
@@ -237,7 +278,11 @@ def _validate_active(data, fname):
     if not isinstance(provenance.get("date"), str) or not provenance["date"].strip():
         raise BaselineError("%s: provenance.date must be a non-empty string" % fname)
     n_runs = provenance.get("n_runs")
-    if not isinstance(n_runs, int) or isinstance(n_runs, bool) or n_runs < 1:
+    if isinstance(n_runs, bool):
+        raise BaselineError("%s: provenance.n_runs must be an integer >= 1, got boolean" % fname)
+    if isinstance(n_runs, float):
+        raise BaselineError("%s: provenance.n_runs must be an integer >= 1, got float %r" % (fname, n_runs))
+    if not isinstance(n_runs, int) or n_runs < 1:
         raise BaselineError("%s: provenance.n_runs must be an integer >= 1" % fname)
     if not isinstance(provenance.get("notes"), str):
         raise BaselineError("%s: provenance.notes must be a string" % fname)
@@ -247,6 +292,8 @@ def _validate_active(data, fname):
     return {
         "family": family,
         "models": list(models),
+        "models_measured": measured,
+        "models_inferred": inferred,
         "probe_set_id": pid,
         "signature": list(sig),
         "control_range": list(cr),
@@ -499,6 +546,8 @@ def build_report(base, model, dialect, control_tokens_list, probe_results, famil
             reference["probe_set_id"] = baseline.get("probe_set_id")
             if baseline.get("confidence") is not None:
                 reference["confidence"] = baseline["confidence"]
+            reference["models_measured"] = list(baseline.get("models_measured") or [])
+            reference["models_inferred"] = list(baseline.get("models_inferred") or [])
             reference["provenance"] = baseline.get("provenance")
             reference["source"] = baseline.get("source")
     else:
@@ -740,6 +789,16 @@ def run(args, api_key=None):
     if baseline is not None and verdict in (
             "SIGNATURE MATCH", "PARTIAL MATCH", "SIGNATURE MISMATCH", "UNSTABLE ACCOUNTING"):
         note += "; " + BASELINE_CAVEAT
+        if any(_model_id_matches(args.model, m) for m in baseline.get("models_inferred", [])):
+            note += "; " + INFERRED_MODEL_CAVEAT
+        if baseline.get("confidence") == "single-route":
+            note += "; " + SINGLE_ROUTE_CAVEAT
+        cr = baseline.get("control_range")
+        if cr and control_tokens_all:
+            first_control = control_tokens_all[0]
+            if first_control < cr[0] or first_control > cr[1]:
+                note += "; control %d is outside the recorded control range [%d,%d] for %s; recorded as a note only, the verdict is unchanged (R2)" % (
+                    first_control, cr[0], cr[1], baseline["family"])
 
     report = build_report(args.base, args.model, dialect, control_tokens_all,
                           probe_results, family, signature,
@@ -1271,8 +1330,11 @@ def selftest():
             code = run(args, api_key="selftest-key")
         return code, out.getvalue() + err.getvalue()
 
-    def scenario_run(scenario, **overrides):
-        server, base = start_gateway(scenario)
+    def scenario_run(scenario, signature=None, **overrides):
+        if signature is None:
+            server, base = start_gateway(scenario)
+        else:
+            server, base = start_gateway(scenario, signature=signature)
         try:
             return run_capture(args_for(base, **overrides))
         finally:
@@ -1359,6 +1421,7 @@ def selftest():
 
     def active_file(family, models, signature, **overrides):
         data = {"schema_version": BASELINE_SCHEMA_VERSION, "family": family, "models": models,
+                "models_measured": list(models), "models_inferred": [],
                 "probe_set_id": pid, "signature": signature, "control_range": [5, 31],
                 "provenance": {"endpoint_kind": "third-party-gateway", "routes": ["route-a"],
                                "date": "2026-11-16", "n_runs": 1, "notes": "test row"}}
@@ -1399,6 +1462,33 @@ def selftest():
         baseline_error({"_reference_only.json": json.dumps(
             {"schema_version": BASELINE_SCHEMA_VERSION,
              "rows": [{"family": "ghost", "models": ["ghost/model"], "signature": [1, 2, 3, 4, 5]}]})}) or ""))
+    check("fail closed: boolean signature element names the file", lambda: "sig_bool.json" in (
+        baseline_error({"sig_bool.json": active_file("deepseek", ["deepseek/deepseek-v4-pro"], [True, 20, 18, 27, 22])}) or ""))
+    check("fail closed: float signature element names the file", lambda: "sig_float.json" in (
+        baseline_error({"sig_float.json": active_file("deepseek", ["deepseek/deepseek-v4-pro"], [14.5, 20, 18, 27, 22])}) or ""))
+    check("fail closed: negative signature element names the file", lambda: "sig_neg.json" in (
+        baseline_error({"sig_neg.json": active_file("deepseek", ["deepseek/deepseek-v4-pro"], [-1, 20, 18, 27, 22])}) or ""))
+    check("fail closed: boolean control_range element names the file", lambda: "cr_bool.json" in (
+        baseline_error({"cr_bool.json": active_file("deepseek", ["deepseek/deepseek-v4-pro"], [14, 20, 18, 27, 22], control_range=[True, 31])}) or ""))
+    check("fail closed: float control_range element names the file", lambda: "cr_float.json" in (
+        baseline_error({"cr_float.json": active_file("deepseek", ["deepseek/deepseek-v4-pro"], [14, 20, 18, 27, 22], control_range=[5.5, 31])}) or ""))
+    check("fail closed: negative control_range element names the file", lambda: "cr_neg.json" in (
+        baseline_error({"cr_neg.json": active_file("deepseek", ["deepseek/deepseek-v4-pro"], [14, 20, 18, 27, 22], control_range=[-1, 31])}) or ""))
+    check("fail closed: float n_runs names the file", lambda: "n_runs_float.json" in (
+        baseline_error({"n_runs_float.json": active_file("deepseek", ["deepseek/deepseek-v4-pro"], [14, 20, 18, 27, 22],
+                                                    provenance={"endpoint_kind": "third-party-gateway", "routes": ["route-a"],
+                                                                "date": "2026-11-16", "n_runs": 1.5, "notes": "test row"})}) or ""))
+    check("fail closed: measured+inferred must cover models, names the file", lambda: "cover.json" in (
+        baseline_error({"cover.json": active_file("deepseek", ["deepseek/deepseek-v4-pro", "deepseek-v4.1-flash"],
+                                                  [14, 20, 18, 27, 22], models_measured=["deepseek/deepseek-v4-pro"])}) or ""))
+    check("fail closed: measured and inferred overlap names the file", lambda: "overlap.json" in (
+        baseline_error({"overlap.json": active_file("deepseek", ["deepseek/deepseek-v4-pro"], [14, 20, 18, 27, 22],
+                                                    models_measured=["deepseek/deepseek-v4-pro"],
+                                                    models_inferred=["deepseek/deepseek-v4-pro"])}) or ""))
+    check("fail closed: empty models_measured names the file", lambda: "emptymeasured.json" in (
+        baseline_error({"emptymeasured.json": active_file("deepseek", ["deepseek/deepseek-v4-pro"], [14, 20, 18, 27, 22],
+                                                          models_measured=[],
+                                                          models_inferred=["deepseek/deepseek-v4-pro"])}) or ""))
 
     def ghost_reference_only():
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1443,6 +1533,20 @@ def selftest():
     check("caveat present on unstable accounting", lambda: (
         "verdict: UNSTABLE ACCOUNTING" in out and "third-party-gateway caveat" in out))
 
+    code, out = scenario_run("honest", model="deepseek/deepseek-v4-pro")
+    check("inferred-model caveat on a model never measured on this text set", lambda: (
+        "verdict: SIGNATURE MATCH" in out
+        and "model ini belum diukur langsung pada text set ini; dipetakan lewat keluarga" in out))
+
+    code, out = scenario_run("honest", model="deepseek/deepseek-v4.1-flash")
+    check("measured model carries no inferred-model caveat", lambda: (
+        "verdict: SIGNATURE MATCH" in out and "model ini belum diukur langsung" not in out))
+
+    code, out = scenario_run("honest", signature=(18, 25, 20, 36, 38), model="anthropic/claude-sonnet-4.6")
+    check("single-route caveat on the single-route baseline", lambda: (
+        "verdict: SIGNATURE MATCH" in out
+        and "single-route caveat: the signature was measured on a single route" in out))
+
     code, out = scenario_run("honest", max_requests=2)
     check("PROBE INCOMPLETE carries no baseline caveat", lambda: (
         "verdict: PROBE INCOMPLETE" in out and "third-party-gateway caveat" not in out))
@@ -1462,12 +1566,49 @@ def selftest():
 
     check("mock report carries baseline probe_set_id and confidence", mock_report_carries_baseline)
 
+    def mock_report_carries_measurement_status():
+        server, base = start_gateway("honest")
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                target = os.path.join(tmpdir, "report.json")
+                run_capture(args_for(base, model="deepseek/deepseek-v4-pro", out=target))
+                with open(target, "r", encoding="utf-8") as fh:
+                    report = json.load(fh)
+        finally:
+            stop_gateway(server)
+        ref = report.get("reference") or {}
+        return (ref.get("models_measured") == ["deepseek/deepseek-v4.1-flash-1017", "deepseek-v4.1-flash"]
+                and ref.get("models_inferred") == ["deepseek/deepseek-v4-pro"])
+
+    check("mock report carries models_measured and models_inferred", mock_report_carries_measurement_status)
+
+    def control_range_note_case():
+        global BASELINE_DIR
+        old_dir = BASELINE_DIR
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with open(os.path.join(old_dir, "deepseek.json"), "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            data["control_range"] = [99, 99]
+            with open(os.path.join(tmpdir, "deepseek.json"), "w", encoding="utf-8") as fh:
+                json.dump(data, fh)
+            BASELINE_DIR = tmpdir
+            try:
+                return scenario_run("honest", model="deepseek/deepseek-v4.1-flash")
+            finally:
+                BASELINE_DIR = old_dir
+
+    code, out = control_range_note_case()
+    check("out-of-range control is a note only; verdict unchanged", lambda: (
+        "verdict: SIGNATURE MATCH" in out
+        and "control 5 is outside the recorded control range [99,99] for deepseek" in out
+        and "the verdict is unchanged (R2)" in out))
+
     total = len(results)
     failed = [d for d, ok in results if not ok]
     passed = total - len(failed)
 
-    if total != 151:
-        print("SELFTEST (v3.1): internal error, expected 151 assertions, ran %d" % total, file=sys.stderr)
+    if total != 166:
+        print("SELFTEST (v3.1): internal error, expected 166 assertions, ran %d" % total, file=sys.stderr)
         return 2
     if failed:
         for d in failed:

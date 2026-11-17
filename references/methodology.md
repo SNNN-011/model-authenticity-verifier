@@ -89,21 +89,34 @@ compared with them.
 ## Baselines and fail-closed loading
 
 Active baselines live in `baselines/*.json`. Each active file carries
-`schema_version`, `family`, `models`, `probe_set_id`, `signature`,
-`control_range`, `provenance` (endpoint kind, routes, date, run count,
-notes) and optionally `confidence`. The `probe_set_id` is computed from
-`PROBES` by the collector (sha256 over the control and probe texts,
-truncated to 8 hex chars) and stored in the file; at load time the loader
-recomputes it from the current probe set and refuses the file when they
-differ. Changing one byte of the probe texts invalidates every active
-baseline by design.
+`schema_version`, `family`, `models`, `models_measured`, `models_inferred`,
+`probe_set_id`, `signature`, `control_range`, `provenance` (endpoint kind,
+routes, date, run count, notes) and optionally `confidence`. The
+`probe_set_id` is computed from `PROBES` by the collector (sha256 over the
+control and probe texts, truncated to 8 hex chars) and stored in the file;
+at load time the loader recomputes it from the current probe set and refuses
+the file when they differ. Changing one byte of the probe texts invalidates
+every active baseline by design.
+
+`models_measured` lists the models seen on the collector's own text set;
+`models_inferred` lists models mapped through the family without a direct
+measurement (e.g. deepseek-v4-pro, HTTP 402 in the 2026-11-16 field notes;
+claude-opus-4.6, absent from the 2026-11-16 field notes). Both must be lists
+of non-empty strings, disjoint from each other, with a union equal to
+`models`; `models_measured` must not be empty. The loader fails closed
+otherwise, naming the file.
 
 Loading is fail closed. Corrupt JSON, an unreadable file, a non-object
 root, an unknown `schema_version`, a signature whose length does not match
 the probe set, a `probe_set_id` mismatch, a duplicate family, an active
 file marked superseded or a file whose models do not map back to its
 family all raise an explicit error naming the file; the run exits 1 before
-any network request. Nothing is skipped silently.
+any network request. Nothing is skipped silently. Every numeric field is
+guarded: booleans, floats and negative values are rejected in `signature`,
+`control_range`, `provenance.n_runs` and `schema_version` (which must equal
+1). `control_range` is a note, never a verdict input: when the measured
+control falls outside it, the note records the fact and the verdict is
+unchanged (R2).
 
 `baselines/_reference_only.json` carries family and model names only,
 never a signature. Rows there are for lookup and the historical record
@@ -118,14 +131,20 @@ Every family verdict that uses an active baseline (`SIGNATURE MATCH`,
 the control-instability and family-unstable cases) carries a
 third-party-gateway caveat: a wrapper can re-tokenize locally or forge
 usage, so a match is WEAK evidence for the counting dialect, never the
-weights (R1).
+weights (R1). When the requested model sits in that baseline's
+`models_inferred`, the note also carries "model ini belum diukur langsung
+pada text set ini; dipetakan lewat keluarga". When the baseline's
+`confidence` is `single-route`, the note also carries "single-route
+caveat: the signature was measured on a single route, so a route-specific
+wrapper cannot be ruled out (R1)".
 
 The `anthropic-4.6` baseline comes from a single vikey run
 (anthropic/claude-sonnet-4.6, control 23). Its values 18 25 20 36 38 are
 read as deltas, by analogy with the deepseek row in
 `field-notes-2026-11.md`, not as raw token counts; the assumption is
 recorded in the file's provenance notes. Treat it as single-route,
-low-confidence evidence.
+low-confidence evidence; every verdict that uses this baseline carries the
+single-route caveat.
 
 ## The fingerprint-degradation caveat (arXiv 2508.19843)
 

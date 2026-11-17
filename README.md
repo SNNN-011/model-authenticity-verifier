@@ -88,8 +88,8 @@ design.
 
 | family key | models | signature (T1..T5) | text set |
 |---|---|---|---|
-| `deepseek` | deepseek/deepseek-v4-pro, deepseek/deepseek-v4.1-flash-1017, deepseek-v4.1-flash | 14 20 18 27 22 | collector's, 2026-11-16 (`baselines/deepseek.json`) |
-| `anthropic-4.6` | anthropic/claude-opus-4.6, anthropic/claude-sonnet-4.6 | 18 25 20 36 38 | collector's, 2026-11-16, single vikey run (`baselines/anthropic-4.6.json`) |
+| `deepseek` | deepseek/deepseek-v4.1-flash-1017, deepseek-v4.1-flash (measured); deepseek/deepseek-v4-pro (inferred: HTTP 402 on this text set) | 14 20 18 27 22 | collector's, 2026-11-16 (`baselines/deepseek.json`) |
+| `anthropic-4.6` | anthropic/claude-sonnet-4.6 (measured); anthropic/claude-opus-4.6 (inferred: not in the 2026-11-16 field notes) | 18 25 20 36 38 | collector's, 2026-11-16, single vikey run (`baselines/anthropic-4.6.json`) |
 
 The `anthropic-4.6` values come from one vikey run (control 23) and are read
 as deltas, by analogy with the deepseek row in `references/field-notes-2026-11.md`,
@@ -110,11 +110,26 @@ Baseline loading is fail closed: corrupt JSON, an unreadable file, a
 non-object root, an unknown `schema_version`, a wrong signature length, a
 `probe_set_id` mismatch, a duplicate family or a malformed file stops the
 run with an error naming the file (exit 1); nothing is skipped silently.
-Every verdict that uses an active baseline (`SIGNATURE MATCH`,
+Every numeric field is guarded: booleans, floats and negative values are
+rejected in `signature`, `control_range`, `provenance.n_runs` and
+`schema_version`. Every verdict that uses an active baseline (`SIGNATURE MATCH`,
 `PARTIAL MATCH`, `SIGNATURE MISMATCH`, `UNSTABLE ACCOUNTING`) carries a
 third-party-gateway caveat: a wrapper can re-tokenize locally or forge
 usage, so this is WEAK evidence for the counting dialect, never the weights
 (R1).
+
+Active baselines also enumerate `models_measured` and `models_inferred`
+(schema_version stays 1): both must be lists of non-empty strings, disjoint
+from each other, with a union equal to `models`, and `models_measured` must
+not be empty; the loader fails closed otherwise, naming the file. A verdict
+that uses an active baseline appends a caveat when the requested model is in
+that baseline's `models_inferred` ("model ini belum diukur langsung pada
+text set ini; dipetakan lewat keluarga"), and, when the baseline's
+`confidence` is `single-route`, a second caveat ("single-route caveat: the
+signature was measured on a single route, so a route-specific wrapper cannot
+be ruled out (R1)"). `control_range` is a note, never a verdict input: when
+the measured control falls outside it, the note records the fact and the
+verdict is unchanged (R2).
 
 Model id to family matching: longest key first, case-insensitive substring
 match. `deepseek-v4-flash` has no usable reference (nondeterministic usage
@@ -186,6 +201,10 @@ T5 arab+misc:
   It maps to `UNMEASURED FAMILY`. A text that moves across repeats is not
   evidence for either side: it is reported as `unstable`, stays in the
   denominator, and cannot by itself produce `SIGNATURE MISMATCH`.
+- **Per-model status is part of the baseline.** `models_measured` were seen
+  on the collector's own texts; `models_inferred` are mapped through the
+  family and carry the caveat above. An inferred reading is one step further
+  from the measurement.
 - **Parameter-independent modifications degrade fingerprints** (wrappers,
   system prompts, RAG; see `references/methodology.md`). A mismatch is a
   reason to investigate, never a conviction.

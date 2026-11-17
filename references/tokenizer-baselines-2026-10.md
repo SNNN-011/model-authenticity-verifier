@@ -21,8 +21,16 @@ Each active baseline stores a `probe_set_id` computed from the collector's
 probe set; the loader recomputes it at load time and refuses the file when
 they differ, so changing one byte of the probe texts invalidates every
 active baseline by design. Loading is fail closed: a corrupt or mismatched
-file stops the run with an error naming the file. See
-[`field-notes-2026-11.md`](field-notes-2026-11.md) for the per-route
+file stops the run with an error naming the file. Each active file also
+enumerates `models_measured` and `models_inferred`: the models seen on this
+text set, and those mapped through the family without a direct measurement
+(deepseek/deepseek-v4-pro, HTTP 402 in the 2026-11-16 field notes;
+anthropic/claude-opus-4.6, absent from the 2026-11-16 field notes). A verdict
+that uses an active baseline appends an inferred-model caveat when the
+requested model is in `models_inferred`, and, for a `single-route`
+confidence baseline, a single-route caveat; `control_range` is a note, never
+a verdict input, and an out-of-range control is recorded in the note only
+(R2). See [`field-notes-2026-11.md`](field-notes-2026-11.md) for the per-route
 measurements.
 
 The other two rows below (`anthropic-core` and `openai`) have no signature
@@ -117,6 +125,11 @@ matches when `abs(delta - reference) <= max(2, ceil(0.08 * reference))`.
 - Match on 0-1/5 texts: `SIGNATURE MISMATCH`.
 - No reference for the claimed family: `UNMEASURED FAMILY`; the deltas are
   reported raw so they can be baselined later.
+- The verdict note carries a third-party-gateway caveat on every family
+  verdict (R1), an inferred-model caveat when the requested model is in the
+  baseline's `models_inferred`, and a single-route caveat when the baseline's
+  `confidence` is `single-route`. `control_range` is a note, never a verdict
+  input (R2).
 
 If the control's token count moves between repeats (`--repeat` > 1), the
 route's usage accounting is not stable and no conclusion is drawn:

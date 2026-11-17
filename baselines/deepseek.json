@@ -6,6 +6,13 @@
     "deepseek/deepseek-v4.1-flash-1017",
     "deepseek-v4.1-flash"
   ],
+  "models_measured": [
+    "deepseek/deepseek-v4.1-flash-1017",
+    "deepseek-v4.1-flash"
+  ],
+  "models_inferred": [
+    "deepseek/deepseek-v4-pro"
+  ],
   "probe_set_id": "6dfaca77",
   "signature": [
     14,
@@ -29,6 +36,6 @@
     ],
     "date": "2026-11-16",
     "n_runs": 6,
-    "notes": "Control \"a\" counted 5 on sumopod and tokenharbor, and 31 on vikey and yeta; the control is subtracted per path, so the deltas are unaffected. T4 was 27 on the two runs that agree with the older (2026-10-29) baseline and 26 on the other four; 27 is used because it matches the older measured baseline and does not change a verdict within tolerance (max(2, ceil(0.08*27)) = 3). See references/field-notes-2026-11.md."
+    "notes": "Control \"a\" counted 5 on sumopod and tokenharbor, and 31 on vikey and yeta; the control is subtracted per path, so the deltas are unaffected. T4 was 27 on the two runs that agree with the older (2026-10-29) baseline and 26 on the other four; 27 is used because it matches the older measured baseline and does not change a verdict within tolerance (max(2, ceil(0.08*27)) = 3). deepseek/deepseek-v4-pro: HTTP 402 in field-notes-2026-11.md, never measured on this text set, mapped through the family (models_inferred). See references/field-notes-2026-11.md."
   }
 }

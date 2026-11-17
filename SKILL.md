@@ -148,8 +148,8 @@ and `anthropic-4.6` rows are kept there as superseded history.
 
 | family key | models | signature | text set |
 |---|---|---|---|
-| `deepseek` | deepseek/deepseek-v4-pro, deepseek/deepseek-v4.1-flash-1017, deepseek-v4.1-flash | 14 20 18 27 22 | collector's, 2026-11-16 |
-| `anthropic-4.6` | anthropic/claude-opus-4.6, anthropic/claude-sonnet-4.6 | 18 25 20 36 38 | collector's, 2026-11-16, single vikey run; values read as deltas by analogy with the deepseek row |
+| `deepseek` | deepseek/deepseek-v4.1-flash-1017, deepseek-v4.1-flash (measured); deepseek/deepseek-v4-pro (inferred: HTTP 402 on this text set) | 14 20 18 27 22 | collector's, 2026-11-16 |
+| `anthropic-4.6` | anthropic/claude-sonnet-4.6 (measured); anthropic/claude-opus-4.6 (inferred: not in the 2026-11-16 field notes) | 18 25 20 36 38 | collector's, 2026-11-16, single vikey run; values read as deltas by analogy with the deepseek row |
 
 Reference-only (`baselines/_reference_only.json`): `anthropic-core`
 (45 40 35 45 47), `openai` (24 24 22 30 29), and the superseded 2026-10-29
@@ -162,6 +162,20 @@ third-party-gateway caveat: a wrapper can re-tokenize locally or forge
 usage, so this is WEAK evidence for the counting dialect, never the weights
 (R1).
 
+Active baselines also enumerate `models_measured` and `models_inferred`
+(schema_version stays 1): disjoint lists of non-empty strings whose union
+equals `models`, with `models_measured` non-empty; the loader fails closed
+otherwise, naming the file. When the requested model is in the baseline's
+`models_inferred`, the verdict note appends "model ini belum diukur langsung
+pada text set ini; dipetakan lewat keluarga"; when the baseline's
+`confidence` is `single-route`, the note appends "single-route caveat: the
+signature was measured on a single route, so a route-specific wrapper cannot
+be ruled out (R1)". Numeric loader fields reject booleans, floats and
+negative values (`signature`, `control_range`, `provenance.n_runs`,
+`schema_version`). `control_range` is a note, never a verdict input: an
+out-of-range control is recorded in the note and the verdict is unchanged
+(R2).
+
 Model id to family matching: longest key first, case-insensitive substring
 match on the model id. `deepseek-v4-flash` has no usable reference
 (nondeterministic usage accounting, see `references/field-notes-2026-10.md`)
@@ -173,6 +187,9 @@ and maps to no family: `UNMEASURED FAMILY`.
   Every family verdict is WEAK FOR/AGAINST at best.
 - Only the two active baselines (deepseek, anthropic-4.6) were measured with
   the collector's own texts; every other family is reference only (R6).
+- Inside those baselines, `models_measured` lists the models seen on this
+  text set; `models_inferred` lists models mapped through the family and
+  carries the inferred-model caveat in the verdict note.
 - Known anomaly routes: `claude-sonnet-5` T5 and `claude-opus-4.7` T4, single
   texts inside agreeing families. Re-run flagged texts.
 - `deepseek-v4-flash` is not fingerprintable with this method today (R5).
