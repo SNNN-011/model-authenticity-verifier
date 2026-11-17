@@ -1,6 +1,6 @@
 # Methodology: input-side tokenizer diff - what the research supports
 
-Reference for `model-authenticity-verifier` (v3.0). One method only:
+Reference for `model-authenticity-verifier` (v3.1). One method only:
 **input-side tokenizer diff against measured family signatures**. This file
 records why that method is the one left standing, what the published
 literature does and does not licence here, and where the signal runs out.
@@ -35,16 +35,38 @@ Two supporting premises from the literature:
 - **Statistical consistency testing** (arXiv 2606.07996). Hypothesis testing
   on hit rates against a reference corpus with significance thresholds. The
   practical reading here: repeat the measurement, and treat instability
-  itself as a finding. That is exactly what `--repeat` does with the control -
-  if the control's token count moves between repeats, the route's usage
-  accounting is not deterministic and the run is discarded
-  (`UNSTABLE ACCOUNTING`, R5).
+  itself as a finding. That is exactly what `--repeat` does. Every probe text
+  is measured `--repeat` times and checked against the same tolerance rule as
+  a baseline. A text whose count moves beyond tolerance is marked unstable.
+  If the control moves, the whole run is discarded (`UNSTABLE ACCOUNTING`,
+  R5).
 
 The related control-subtraction step is also engineering practice, not a
 paper. `delta(T) = tokens(T) - tokens("a")` on the same path cancels that
 path's template and system-prompt overhead, so counts are comparable across
 routes without a third control endpoint (R2). Never compare raw token
 counts across paths.
+
+## Unstable texts stay in the denominator
+
+Repeat stability is checked per text, not only on the control. An unstable
+text is not silently dropped, because dropping it would flatter the
+comparison: the route can still show its instability and the sample cannot be
+quietly reshaped. Unstable texts therefore stay in the denominator N.
+
+The mismatch rule follows from that:
+
+- a miss only counts when it was measured stably;
+- `SIGNATURE MISMATCH` needs at least two stably measured misses (R5);
+- `SIGNATURE MATCH` requires every text to be stable and match;
+- `PARTIAL MATCH` requires exactly one non-matching text out of at least two,
+  and that text may be a stable miss or an unstable text;
+- any other result with an unstable text is `UNSTABLE ACCOUNTING`, never a
+  mismatch.
+
+Decision order is fixed: `ENDPOINT UNAVAILABLE` > `NO USAGE REPORTED` >
+`PROBE INCOMPLETE` > `UNSTABLE ACCOUNTING` > family verdict. A family verdict
+is never printed over a failed prerequisite.
 
 ## Family-dividing texts
 
@@ -112,7 +134,7 @@ is the statistical kind.
 | Tokenizer engineering practice | `usage.input_tokens` / `usage.prompt_tokens` deltas per text | all family verdicts |
 | Control subtraction (engineering practice) | `delta(T) = tokens(T) - tokens("a")`, same path (R2) | makes cross-route deltas comparable |
 | Natural fingerprints (arXiv 2504.14871) | premise: families tokenise distinguishably | `SIGNATURE MATCH` / `SIGNATURE MISMATCH` (WEAK) |
-| Statistical consistency (arXiv 2606.07996) | `--repeat`, control compared across repeats (R5) | `UNSTABLE ACCOUNTING` when the control moves |
+| Statistical consistency (arXiv 2606.07996) | `--repeat`, control and every text compared across repeats (R5) | `UNSTABLE ACCOUNTING` when the control moves or no stable verdict is possible |
 | Parameter-independent degradation (arXiv 2508.19843) | caveat on every reading | caps match at WEAK FOR; mismatch = investigate, not convict |
 | AEX / gateway-provenance threat (arXiv 2603.14283, 2606.22560) | reason the method cannot prove identity | report wording: WEAK FOR / mismatch, never "verified genuine" |
 
@@ -134,7 +156,9 @@ exposes.
 - A route with nondeterministic usage accounting cannot be fingerprinted at
   all (`UNSTABLE ACCOUNTING`); `deepseek-v4-flash` is the known case.
 - No statistical significance machinery beyond the tolerance rule and the
-  repeat check; no confidence intervals are computed or printed.
+  per-text repeat check; no confidence intervals are computed or printed.
+- `--max-requests` bounds the run, so a truncated run reports
+  `PROBE INCOMPLETE` rather than borrowing a verdict from partial data.
 
 ## Sources
 

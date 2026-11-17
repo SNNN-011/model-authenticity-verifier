@@ -3,14 +3,14 @@ name: model-authenticity-verifier
 description: "Audit a third-party LLM gateway with one black-box method: input-side tokenizer diff against measured family signatures, from a prompt-only request and a control, compared per-family. Use when a cheap or free gateway claims to serve a specific model and you want to know whether the route counts tokens like that family. Three inputs: base URL, API key, model id."
 ---
 
-# Model Authenticity Verifier (v3.0)
+# Model Authenticity Verifier (v3.1)
 
 One method, stated plainly: send five family-dividing probe texts plus a
 one-character control to the endpoint, read the prompt token count from
 `usage`, subtract the control, and compare the five deltas against the
 measured signature of the claimed model's family.
 
-This is v3.0. v2.x carried six probe families (infrastructure audit, service
+This is v3.1. v2.x carried six probe families (infrastructure audit, service
 checks, a seedable capability battery, dual-depth needle, self-report,
 differential and logprobs testing). All of that is gone. What remains is the
 single method below, which is cheap, needs no baseline endpoint and works on
@@ -51,7 +51,12 @@ R4. **Dead is not fake.** Consistent timeouts are reported as
     `ENDPOINT UNAVAILABLE`, never as rejection.
 R5. **Unstable accounting invalidates a run.** If the control count moves
     between repeats, the route's usage numbers are not deterministic and
-    nothing can be concluded from that run (`UNSTABLE ACCOUNTING`).
+    nothing can be concluded from that run (`UNSTABLE ACCOUNTING`). A text
+    whose delta moves beyond tolerance is not scored as a match or a
+    mismatch: it is reported as `unstable`, stays in the N denominator, and
+    is counted in the note. A family mismatch needs at least two stably
+    measured misses; with fewer than two, the result is `UNSTABLE ACCOUNTING`,
+    not `SIGNATURE MISMATCH`.
 R6. **The text set is part of the measurement.** The reference signatures
     were measured on 2026-10-29 with a text set of the same composition
     (id+accuse, jv+price, code, cjk+emoji, arab+misc) whose exact strings
@@ -63,32 +68,42 @@ R6. **The text set is part of the measurement.** The reference signatures
 
 ```
 1. Collect three inputs: base URL, API key, model id. Nothing else is needed.
-   python scripts/verify_gateway.py --base <URL> --model <ID> --key <KEY>
+   The key comes from env VERIFY_API_KEY, or from one line on stdin with
+   --key-stdin. --key is refused because argv is visible in the process list.
+   VERIFY_API_KEY=... python scripts/verify_gateway.py --base <URL> --model <ID>
 
 2. Read the report. The verdict comes with per-text deltas, the tolerance
    rule and the family comparison. Key material never appears in the report.
-   Optional flags: --sleep S (default 2), --timeout S (default 60),
+   With --repeat N, every repeat is stored per text and the report shows the
+   repeat values, min/max and a text_unstable flag. Optional flags:
+   --key-stdin, --sleep S (default 2), --timeout S (default 60),
    --repeat N (default 1; enables the R5 stability check),
+   --max-requests N (stop and report PROBE INCOMPLETE when the request budget
+   is exhausted; the estimate is printed before the run),
    --out FILE (full JSON), --texts FILE (alternate text set, reference
    comparison skipped). Offline logic check: `python scripts/verify_gateway.py
    selftest`, exits 0 on pass.
 
-3. Decide. 4-5/5 matches is `SIGNATURE MATCH` (WEAK FOR); 2-3 is
-   `PARTIAL MATCH`, re-run with fresh texts; 0-1 is `SIGNATURE MISMATCH`.
-   If anything is ambiguous, re-run with `--repeat` > 1 or `--texts` before
-   drawing a conclusion. The exit code is 0 for any verdict, 1 for usage or
-   CLI errors, 2 for selftest failure.
+3. Decide. All N texts match: `SIGNATURE MATCH` (WEAK FOR). Exactly N-1
+   match: `PARTIAL MATCH`; re-run with fresh texts. N-2 or fewer match with
+   at least two stably measured misses: `SIGNATURE MISMATCH`. If unstable
+   texts leave fewer than two stable misses, the result is
+   `UNSTABLE ACCOUNTING`, not a mismatch. For the default N=5 this is 5/5
+   MATCH, 4/5 PARTIAL, and 3/5 or fewer MISMATCH when at least two stable
+   texts miss. If anything is ambiguous, re-run with `--repeat` > 1 or
+   `--texts` before drawing a conclusion. The exit code is 0 for any verdict,
+   1 for usage or CLI errors, 2 for selftest failure.
 ```
 
 ## Reading the Verdicts
 
 | Verdict | Meaning |
 |---|---|
-| `SIGNATURE MATCH` | 5 of 5 texts agree with the claimed family's reference signature. WEAK FOR: same tokenizer dialect, not proof of weights. |
-| `PARTIAL MATCH` | 4 of 5 agree. One text that misses is an anomaly, not a family split (R3): re-run with fresh texts before concluding anything. |
-| `SIGNATURE MISMATCH` | 3 or fewer agree. The tokenizer does not look like the claimed family's. |
+| `SIGNATURE MATCH` | All N texts agree with the claimed family's reference signature. WEAK FOR: same tokenizer dialect, not proof of weights. |
+| `PARTIAL MATCH` | Exactly N-1 agree. One text that misses is an anomaly, not a family split (R3): re-run with fresh texts before concluding anything. |
+| `SIGNATURE MISMATCH` | N-2 or fewer agree and at least two stably measured texts miss. The tokenizer does not look like the claimed family's. If unstable texts leave fewer than two stable misses, the result is `UNSTABLE ACCOUNTING` instead. |
 | `UNMEASURED FAMILY` | no reference signature for the claimed model. The deltas are reported raw so they can be baselined later. |
-| `UNSTABLE ACCOUNTING` | the control's token count moved between repeats (only checked with `--repeat` > 1). The route's usage accounting is not stable, so no conclusion is drawn. |
+| `UNSTABLE ACCOUNTING` | the control's token count moved between repeats, or unstable texts leave fewer than two stably measured misses (only checked with `--repeat` > 1). The route's usage accounting is not stable, so no conclusion is drawn. |
 | `PROBE INCOMPLETE` | the route answered but some texts could not be measured. The deltas are partial, so no family verdict is drawn. Re-run. |
 | `ENDPOINT UNAVAILABLE` | the endpoint did not answer usefully: timeout, refusal or an HTTP error. The note carries the status. Dead is not fake, and neither is a refusal. |
 | `NO USAGE REPORTED` | responses carried no token usage, so the method could not run. |
@@ -97,7 +112,10 @@ Decision order: endpoint unavailable > no usage reported > probe incomplete >
 unstable accounting > family verdict.
 
 A text matches its reference when
-`abs(delta - reference) <= max(2, ceil(0.08 * reference))`.
+`abs(delta - reference) <= max(2, ceil(0.08 * reference))`. A text is
+`unstable` when its delta range across repeats exceeds the same tolerance
+(exact equality when there is no reference). Unstable texts stay in the N
+denominator and are reported in the note, never silently dropped.
 
 ## What This Can and Cannot Show
 
@@ -137,6 +155,9 @@ and maps to no family: `UNMEASURED FAMILY`.
 - Known anomaly routes: `claude-sonnet-5` T5 and `claude-opus-4.7` T4, single
   texts inside agreeing families. Re-run flagged texts.
 - `deepseek-v4-flash` is not fingerprintable with this method today (R5).
+- A text that moves across repeats is not evidence for either side. It stays
+  in the denominator and is counted in the note; a family mismatch needs at
+  least two stably measured misses.
 - This is not proof of authenticity. Nothing black-box is. Weights, an
   owner-keyed fingerprint or attested hardware are required, and none of
   those ship over a bearer-key HTTP endpoint.

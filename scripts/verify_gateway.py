@@ -1,23 +1,30 @@
 #!/usr/bin/env python3
-# model-authenticity-verifier v3.0 - single-method tokenizer-diff collector.
+# model-authenticity-verifier v3.1 - single-method tokenizer-diff collector.
 # Method: delta(T) = tokens(T) - tokens("a") on the same path, compared to family signatures.
 import argparse
+import contextlib
+import http.server
+import io
 import json
 import math
 import os
 import sys
+import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime
 
-VERSION = "3.0"
+VERSION = "3.1"
 TOOL = "model-authenticity-verifier"
 CONTROL_TEXT = "a"
-USER_AGENT = "model-authenticity-verifier/3.0"
+USER_AGENT = "model-authenticity-verifier/3.1"
 # Reasoning routes burn the budget and answer 502; prompt_tokens does not depend on max_tokens.
 MAX_TOKENS_LADDER = [64, 512, 2048]
 RETRYABLE_HTTP = (429, 500, 502, 503, 504)
+# Selftest only: skip retry backoff so the offline check stays fast.
+FAST_SLEEP = False
 
 # Probe texts: the public text set the reference signatures were measured with
 # (control "a" plus five family-dividing texts). The exact strings matter: the
@@ -47,6 +54,40 @@ _MODEL_KEYS = {
     "deepseek": ["deepseek/deepseek-v4-pro", "deepseek/deepseek-v4.1-flash-1017", "deepseek-v4.1-flash"],
 }
 
+
+class ProbeFailure(Exception):
+    pass
+
+
+class RequestBudget:
+    """Count every HTTP attempt, including retries and ladder rungs."""
+
+    def __init__(self, limit=0):
+        self.limit = int(limit or 0)
+        self.used = 0
+        self.exceeded = False
+
+    def acquire(self):
+        if self.limit and self.used >= self.limit:
+            self.exceeded = True
+            raise ProbeFailure("request budget exhausted after %d request(s)" % self.used)
+        self.used += 1
+
+
+class SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuse redirects that would carry the auth headers to another host."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        old_url = req.full_url
+        target = urllib.parse.urljoin(old_url, newurl)
+        old_host = urllib.parse.urlsplit(old_url).netloc.lower()
+        new_host = urllib.parse.urlsplit(target).netloc.lower()
+        if old_host != new_host:
+            raise ProbeFailure(
+                "redirect to a different host refused (HTTP %d): auth headers are not forwarded across hosts" % code)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 def _family_keys():
     keys = []
     for family, models in _MODEL_KEYS.items():
@@ -61,6 +102,7 @@ def _family_keys():
     out = sorted(seen.items(), key=lambda kv: len(kv[0]), reverse=True)
     return out
 
+
 def map_family(model_id):
     mid = (model_id or "").lower()
     for key, family in _family_keys():
@@ -68,14 +110,34 @@ def map_family(model_id):
             return family
     return None
 
+
 def tolerance(reference):
     return max(2, math.ceil(0.08 * reference))
+
 
 def compute_delta(tokens_text, tokens_control):
     return tokens_text - tokens_control
 
+
 def text_matches(delta, reference):
     return abs(delta - reference) <= tolerance(reference)
+
+
+def stability_tolerance(reference):
+    # A reference-less text set has no scale, so repeats must agree exactly.
+    return tolerance(reference) if reference is not None else 0
+
+
+def text_moved(deltas, reference):
+    if len(deltas) < 2:
+        return False
+    return (max(deltas) - min(deltas)) > stability_tolerance(reference)
+
+
+def median_int(values):
+    ordered = sorted(values)
+    return ordered[len(ordered) // 2]
+
 
 def parse_usage_tokens(body):
     if not isinstance(body, dict):
@@ -91,23 +153,35 @@ def parse_usage_tokens(body):
             return v
     return None
 
-def family_verdict(matches):
-    # 5 of 5 is the only clean family agreement. A single text that misses is an
-    # anomaly, not a family split (R3), so 4 of 5 stays undecided and 3 or fewer
-    # is a disagreement.
-    if matches >= 5:
+
+def family_verdict(matches, total, unstable=0):
+    # All texts must agree for a match. One miss stays undecided (R3). A
+    # mismatch needs two stably measured misses; with fewer than that, unstable
+    # texts leave the family undecided instead of turning into a mismatch (R5).
+    if matches is None or total is None or total <= 0:
+        return "UNMEASURED FAMILY"
+    if unstable < 0:
+        unstable = 0
+    stable_mismatches = total - matches - unstable
+    if unstable == 0 and matches >= total:
         return "SIGNATURE MATCH"
-    if matches == 4:
+    if total >= 2 and matches == total - 1:
         return "PARTIAL MATCH"
+    if stable_mismatches >= 2:
+        return "SIGNATURE MISMATCH"
+    if unstable > 0:
+        return "UNSTABLE ACCOUNTING"
     return "SIGNATURE MISMATCH"
+
 
 def is_unstable(control_counts):
     return len(set(control_counts)) > 1
 
+
 # Decision order: endpoint unavailable > no usage reported > probe incomplete >
 # unstable accounting > family verdict.
 def decide(endpoint_failed=False, usage_missing=False, incomplete=False,
-           unstable=False, family=None, matches=None):
+           unstable=False, family=None, matches=None, total=5, unstable_texts=0):
     if endpoint_failed:
         return "ENDPOINT UNAVAILABLE"
     if usage_missing:
@@ -120,7 +194,8 @@ def decide(endpoint_failed=False, usage_missing=False, incomplete=False,
         return "UNMEASURED FAMILY"
     if matches is None:
         return "UNMEASURED FAMILY"
-    return family_verdict(matches)
+    return family_verdict(matches, total, unstable_texts)
+
 
 def load_texts(path):
     texts = []
@@ -137,6 +212,39 @@ def load_texts(path):
             texts.append((name, content))
     return texts
 
+
+def read_key(args):
+    """Key only from env or stdin; argv is visible to other processes."""
+    if getattr(args, "key_stdin", False):
+        try:
+            key = sys.stdin.readline().strip()
+        except (AttributeError, OSError):
+            return None, "--key-stdin was given but stdin could not be read"
+        if not key:
+            return None, "--key-stdin was given but stdin was empty"
+        return key, None
+    key = os.environ.get("VERIFY_API_KEY")
+    if not key:
+        return None, "API key required via VERIFY_API_KEY or --key-stdin"
+    return key, None
+
+
+def reject_key_argv(argv):
+    for token in argv:
+        if token == "--key" or token.startswith("--key="):
+            return True
+    return False
+
+
+def estimate_run_requests(n_texts, repeat):
+    return max(0, repeat) * (1 + n_texts)
+
+
+def pause(seconds):
+    if seconds > 0 and not FAST_SLEEP:
+        time.sleep(seconds)
+
+
 def post_json(url, payload, key, timeout):
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
@@ -151,17 +259,20 @@ def post_json(url, payload, key, timeout):
         },
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    opener = urllib.request.build_opener(SafeRedirectHandler())
+    with opener.open(req, timeout=timeout) as resp:
         return resp.status, json.loads(resp.read().decode("utf-8", errors="replace"))
 
-def probe_once(base, model, key, text, dialect_holder, timeout, attempts=3):
+
+def probe_once(base, model, key, text, dialect_holder, timeout, attempts=3, budget=None):
     """One prompt-only request, with a max_tokens ladder and retries.
 
     A reasoning route burns its budget and answers 502, so the ladder climbs
     instead of failing; prompt_tokens does not change with max_tokens. A
     transient drop is retried, because one dropped connection is not a dead
     route (R4). A 404/405 on the OpenAI dialect switches the run to the
-    Anthropic dialect.
+    Anthropic dialect. A cross-host redirect is refused before it can carry
+    the auth headers to another host.
     """
     last = "endpoint did not answer"
     switched = False
@@ -170,9 +281,13 @@ def probe_once(base, model, key, text, dialect_holder, timeout, attempts=3):
         body = {"model": model, "messages": [{"role": "user", "content": text}],
                 "max_tokens": max_tokens, "stream": False}
         for attempt in range(attempts):
+            if budget is not None:
+                budget.acquire()
             try:
                 _, resp_body = post_json(base.rstrip("/") + path, body, key, timeout)
                 return resp_body
+            except ProbeFailure:
+                raise
             except urllib.error.HTTPError as e:
                 code = e.code
                 if code in (404, 405) and dialect_holder[0] == "openai" and not switched:
@@ -183,24 +298,25 @@ def probe_once(base, model, key, text, dialect_holder, timeout, attempts=3):
                 if code in RETRYABLE_HTTP:
                     if code == 502 and rung + 1 < len(MAX_TOKENS_LADDER):
                         break
-                    time.sleep(1.5 * (attempt + 1))
+                    pause(1.5 * (attempt + 1))
                     continue
                 raise ProbeFailure(last)
             except (urllib.error.URLError, TimeoutError, OSError, ValueError) as e:
                 last = "endpoint did not answer (%s)" % type(e).__name__
-                time.sleep(1.5 * (attempt + 1))
+                pause(1.5 * (attempt + 1))
                 continue
         if switched:
             break
     if switched:
-        return probe_once(base, model, key, text, dialect_holder, timeout, attempts)
+        return probe_once(base, model, key, text, dialect_holder, timeout, attempts, budget)
     raise ProbeFailure(last)
 
-class ProbeFailure(Exception):
-    pass
 
 def build_report(base, model, dialect, control_tokens_list, probe_results, family,
-                 signature, matches, verdict, note, failed_probes=None):
+                 signature, matches, verdict, note, failed_probes=None,
+                 total_texts=None, unstable_texts=None, budget=None,
+                 estimated_requests=None):
+    control_unstable = (len(control_tokens_list) > 1 and is_unstable(control_tokens_list))
     report = {
         "tool": TOOL,
         "version": VERSION,
@@ -208,24 +324,47 @@ def build_report(base, model, dialect, control_tokens_list, probe_results, famil
         "model": model,
         "started": datetime.now().astimezone().isoformat(timespec="seconds"),
         "dialect": dialect,
-        "control": {"text": CONTROL_TEXT, "tokens": control_tokens_list[0] if control_tokens_list else None},
+        "control": {
+            "text": CONTROL_TEXT,
+            "tokens": control_tokens_list[0] if control_tokens_list else None,
+            "repeats": list(control_tokens_list),
+            "min": min(control_tokens_list) if control_tokens_list else None,
+            "max": max(control_tokens_list) if control_tokens_list else None,
+            "unstable": control_unstable,
+        },
         "reference": ({"family": family, "signature": signature} if family else None),
         "probes": probe_results,
         "matches": matches,
+        "texts_total": total_texts if total_texts is not None else len(probe_results),
+        "unstable_texts": list(unstable_texts or []),
         "verdict": verdict,
         "note": note,
         "failed_probes": list(failed_probes or []),
+        "budget": {
+            "estimated": estimated_requests,
+            "limit": budget.limit if budget is not None else 0,
+            "used": budget.used if budget is not None else 0,
+            "exceeded": bool(budget is not None and budget.exceeded),
+        },
     }
     return report
 
-def run(args):
+
+def format_values(values):
+    return ",".join(str(v) for v in values)
+
+
+def run(args, api_key=None):
     if not args.base or not args.model:
         print("error: --base and --model are required", file=sys.stderr)
         return 1
-    key = args.key or os_environ_key()
-    if not key:
-        print("error: API key required via --key or VERIFY_API_KEY", file=sys.stderr)
-        return 1
+    if api_key is None:
+        key, key_error = read_key(args)
+        if key_error:
+            print("error: %s" % key_error, file=sys.stderr)
+            return 1
+    else:
+        key = api_key
     if args.repeat < 1:
         print("error: --repeat must be >= 1", file=sys.stderr)
         return 1
@@ -234,6 +373,9 @@ def run(args):
         return 1
     if args.sleep < 0:
         print("error: --sleep must be >= 0", file=sys.stderr)
+        return 1
+    if getattr(args, "max_requests", 0) is None or getattr(args, "max_requests", 0) < 0:
+        print("error: --max-requests must be >= 0", file=sys.stderr)
         return 1
 
     custom_texts = bool(args.texts)
@@ -251,19 +393,35 @@ def run(args):
 
     family = None if custom_texts else map_family(args.model)
     signature = REFERENCE.get(family) if family else None
+    n_texts = len(texts)
+    estimated = estimate_run_requests(n_texts, args.repeat)
+    print("estimated requests: %d (control + %d texts, repeat %d; retries and the max_tokens ladder can add more)" % (
+        estimated, n_texts, args.repeat))
+    max_requests = getattr(args, "max_requests", 0) or 0
+    if max_requests:
+        print("request limit: %d" % max_requests)
+        if estimated > max_requests:
+            print("warning: the estimate exceeds --max-requests; the run will stop and report PROBE INCOMPLETE")
+
+    budget = RequestBudget(max_requests)
 
     dialect_holder = ["openai"]
     control_tokens_all = []
-    probe_bodies = []  # raw tokens per probe for report (first repeat only)
+    tokens_by_name = {name: [] for name, _ in texts}
     endpoint_error = None
     usage_missing = False
     failed_probes = []
+    budget_stopped = False
 
     for rep in range(args.repeat):
         # control first, then probes, same path, same body shape
         try:
-            ctrl_body = probe_once(args.base, args.model, key, CONTROL_TEXT, dialect_holder, args.timeout)
+            ctrl_body = probe_once(args.base, args.model, key, CONTROL_TEXT, dialect_holder,
+                                   args.timeout, budget=budget)
         except ProbeFailure as e:
+            if budget.exceeded:
+                budget_stopped = True
+                break
             endpoint_error = str(e)
             break
         ctrl_tok = parse_usage_tokens(ctrl_body)
@@ -271,50 +429,76 @@ def run(args):
             usage_missing = True
             break
         control_tokens_all.append(ctrl_tok)
-        if rep == 0:
-            probe_bodies = []
-        sleep_between(args.sleep)
+        pause(args.sleep)
         for i, (name, text) in enumerate(texts):
             try:
-                body = probe_once(args.base, args.model, key, text, dialect_holder, args.timeout)
+                body = probe_once(args.base, args.model, key, text, dialect_holder,
+                                  args.timeout, budget=budget)
             except ProbeFailure as e:
+                if budget.exceeded:
+                    budget_stopped = True
+                    break
                 failed_probes.append("%s (%s)" % (name, e))
                 continue
             tok = parse_usage_tokens(body)
             if tok is None:
                 failed_probes.append("%s (no token usage in the response)" % name)
                 continue
-            if rep == 0:
-                probe_bodies.append((name, text, tok))
+            tokens_by_name[name].append((rep, tok))
             if i < len(texts) - 1 or rep < args.repeat - 1:
-                sleep_between(args.sleep)
+                pause(args.sleep)
+        if budget_stopped:
+            break
         if endpoint_error or usage_missing:
             break
 
     dialect = dialect_holder[0]
-    unstable = (args.repeat > 1 and len(control_tokens_all) > 1 and is_unstable(control_tokens_all))
+    control_unstable = (args.repeat > 1 and len(control_tokens_all) > 1 and is_unstable(control_tokens_all))
 
     probe_results = []
     matches = None
-    if not endpoint_error and not usage_missing and probe_bodies:
-        ctrl = control_tokens_all[0]
-        matched = 0
-        for idx, (name, text, tok) in enumerate(probe_bodies):
-            delta = compute_delta(tok, ctrl)
+    unstable_texts = []
+    if control_tokens_all and not endpoint_error and not usage_missing:
+        for idx, (name, text) in enumerate(texts):
+            pairs = tokens_by_name[name]
             ref = signature[idx] if signature and idx < len(signature) else None
-            # unstable accounting: deltas reported raw, no match scoring at all (R5)
-            m = (text_matches(delta, ref) if ref is not None and not unstable and not failed_probes else None)
-            if m:
-                matched += 1
+            tokens_repeats = [tok for _, tok in pairs]
+            deltas = [tok - control_tokens_all[rep] for rep, tok in pairs if rep < len(control_tokens_all)]
+            unstable_text = text_moved(deltas, ref)
+            delta = median_int(deltas) if deltas else None
+            if unstable_text:
+                status = "unstable"
+                unstable_texts.append(name)
+            elif ref is None:
+                status = "unmeasured"
+            elif control_unstable or failed_probes or budget_stopped:
+                status = "unscored"
+            elif text_matches(delta, ref):
+                status = "match"
+            else:
+                status = "mismatch"
             probe_results.append({
                 "name": name,
-                "tokens": tok,
+                "tokens": tokens_repeats[0] if tokens_repeats else None,
+                "tokens_repeats": tokens_repeats,
                 "delta": delta,
+                "delta_repeats": deltas,
+                "min": min(deltas) if deltas else None,
+                "max": max(deltas) if deltas else None,
                 "reference": ref,
-                "match": m,
+                "match": (True if status == "match" else False if status == "mismatch" else None),
+                "text_unstable": unstable_text,
+                "status": status,
                 "chars": len(text),
             })
-        matches = (matched if signature and not unstable and not failed_probes else None)
+        if signature and not control_unstable and not failed_probes and not budget_stopped:
+            matches = sum(1 for p in probe_results if p["status"] == "match")
+
+    failed_names = []
+    for entry in failed_probes:
+        name = entry.split(" (", 1)[0]
+        if name not in failed_names:
+            failed_names.append(name)
 
     if endpoint_error:
         verdict = decide(endpoint_failed=True)
@@ -322,30 +506,44 @@ def run(args):
     elif usage_missing:
         verdict = decide(usage_missing=True)
         note = "responses carried no token usage; the method could not run"
+    elif budget_stopped:
+        measured = sum(1 for p in probe_results if p["tokens"] is not None)
+        verdict = decide(incomplete=True)
+        note = "request budget of %d exhausted after %d request(s); only %d of %d texts were measured, so the probe is incomplete" % (
+            budget.limit, budget.used, measured, n_texts)
     elif failed_probes:
         verdict = decide(incomplete=True)
         note = "the route answered but %d of %d texts could not be measured (%s); the deltas below are partial, re-run (R4)" % (
-            len(failed_probes), len(texts), "; ".join(failed_probes))
-    elif unstable:
+            len(failed_names), n_texts, "; ".join(failed_probes))
+    elif control_unstable:
         verdict = decide(unstable=True)
         note = "control token count moved across repeats (%s); usage accounting is not stable, no conclusion drawn (R5)" % (
             ",".join(str(c) for c in control_tokens_all))
     elif custom_texts:
         verdict = decide(family=None)
         note = "alternate text set; reference comparison skipped, deltas reported raw"
+        if unstable_texts:
+            note += "; %d text(s) moved beyond tolerance across repeats and were not scored (R5)" % len(unstable_texts)
     elif family is None:
         verdict = decide(family=None)
         note = "no reference signature for the claimed model; deltas reported raw so they can be baselined later"
+        if unstable_texts:
+            note += "; %d text(s) moved beyond tolerance across repeats and were not scored (R5)" % len(unstable_texts)
     elif signature is None:
         verdict = decide(family=None)
         note = "the %s family is known, but no signature was measured with these texts; deltas reported raw (R6)" % family
+        if unstable_texts:
+            note += "; %d text(s) moved beyond tolerance across repeats and were not scored (R5)" % len(unstable_texts)
     else:
-        verdict = decide(family=family, matches=matches)
-        note = verdict_note(verdict, matches)
+        verdict = decide(family=family, matches=matches, total=n_texts,
+                         unstable_texts=len(unstable_texts))
+        note = verdict_note(verdict, matches, n_texts, len(unstable_texts))
 
     report = build_report(args.base, args.model, dialect, control_tokens_all,
                           probe_results, family, signature,
-                          matches, verdict, note, failed_probes)
+                          matches, verdict, note, failed_probes,
+                          total_texts=n_texts, unstable_texts=unstable_texts,
+                          budget=budget, estimated_requests=estimated)
 
     print("base: %s" % args.base)
     print("model: %s" % args.model)
@@ -353,14 +551,21 @@ def run(args):
     if control_tokens_all:
         print("control \"%s\": %s token(s)" % (CONTROL_TEXT, ",".join(str(c) for c in control_tokens_all)))
     for p in probe_results:
+        tokens_s = format_values(p["tokens_repeats"]) if len(p["tokens_repeats"]) > 1 else (
+            str(p["tokens"]) if p["tokens"] is not None else "?")
+        delta_s = format_values(p["delta_repeats"]) if len(p["delta_repeats"]) > 1 else (
+            str(p["delta"]) if p["delta"] is not None else "?")
+        spread = ""
+        if len(p["delta_repeats"]) > 1:
+            spread = " min=%s max=%s" % (p["min"], p["max"])
         if p["reference"] is None:
-            print("%s: tokens=%d delta=%d chars=%d" % (p["name"], p["tokens"], p["delta"], p["chars"]))
+            print("%s: tokens=%s delta=%s%s chars=%d" % (p["name"], tokens_s, delta_s, spread, p["chars"]))
         else:
-            match_s = "skip" if p["match"] is None else ("yes" if p["match"] else "no")
-            print("%s: tokens=%d delta=%d ref=%d match=%s chars=%d" % (
-                p["name"], p["tokens"], p["delta"], p["reference"], match_s, p["chars"]))
+            match_s = "unstable" if p["text_unstable"] else ("skip" if p["match"] is None else ("yes" if p["match"] else "no"))
+            print("%s: tokens=%s delta=%s ref=%d match=%s%s chars=%d" % (
+                p["name"], tokens_s, delta_s, p["reference"], match_s, spread, p["chars"]))
     if matches is not None:
-        print("matches: %d/5" % matches)
+        print("matches: %d/%d" % (matches, n_texts))
     for f in failed_probes:
         print("not measured: %s" % f)
     print("verdict: %s" % verdict)
@@ -376,25 +581,65 @@ def run(args):
             return 1
     return 0
 
-def verdict_note(verdict, matches):
+
+def verdict_note(verdict, matches, total, unstable_count=0):
+    suffix = ""
+    if unstable_count:
+        suffix = "; %d text(s) moved beyond tolerance across repeats and were not scored (R5)" % unstable_count
     if verdict == "SIGNATURE MATCH":
-        return "%d/5 texts agree with the claimed family; WEAK evidence for tokenizer dialect only, never weights (R1)" % matches
+        return "%d/%d texts agree with the claimed family; WEAK evidence for tokenizer dialect only, never weights (R1)%s" % (
+            matches, total, suffix)
     if verdict == "PARTIAL MATCH":
-        return "%d/5 texts agree; one text that misses is an anomaly, not a family split, re-run with fresh texts (R3)" % matches
-    return "%d/5 texts agree; the tokenizer does not look like the claimed family's" % matches
+        return "%d/%d texts agree; one text that misses is an anomaly, not a family split, re-run with fresh texts (R3)%s" % (
+            matches, total, suffix)
+    if verdict == "UNSTABLE ACCOUNTING":
+        return "%d/%d texts matched and fewer than 2 stably measured texts disagreed; %d text(s) were unstable across repeats, so no family verdict is drawn (R5)" % (
+            matches, total, unstable_count)
+    return "%d/%d texts agree; the tokenizer does not look like the claimed family's%s" % (
+        matches, total, suffix)
+
 
 def sleep_between(seconds):
-    if seconds > 0:
-        time.sleep(seconds)
+    pause(seconds)
 
-def os_environ_key():
-    return os.environ.get("VERIFY_API_KEY")
+
+def main():
+    # never let a non-ASCII probe name kill output on a legacy console codepage
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(errors="replace")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(errors="replace")
+    argv = sys.argv[1:]
+    if reject_key_argv(argv):
+        print("error: --key is not accepted because command-line arguments are visible in the process list; "
+              "use VERIFY_API_KEY or --key-stdin", file=sys.stderr)
+        return 1
+    if argv and argv[0] == "selftest":
+        return selftest()
+
+    parser = VerifierArgumentParser(
+        description="Model-authenticity verifier: input-side tokenizer diff against measured family signatures.")
+    parser.add_argument("--base", help="base URL of the gateway, e.g. https://gw.example.com/v1")
+    parser.add_argument("--model", help="model id to check, e.g. anthropic/claude-opus-4.8")
+    parser.add_argument("--key-stdin", action="store_true",
+                        help="read the API key from one line on stdin; env VERIFY_API_KEY is the other option")
+    parser.add_argument("--sleep", type=float, default=2, help="seconds between requests (default 2)")
+    parser.add_argument("--timeout", type=float, default=60, help="per-request timeout in seconds (default 60)")
+    parser.add_argument("--repeat", type=int, default=1, help="repeat the probe set N times (default 1)")
+    parser.add_argument("--max-requests", type=int, default=0,
+                        help="stop after N HTTP requests and report PROBE INCOMPLETE (default 0 = unlimited)")
+    parser.add_argument("--out", help="write the full JSON report to FILE")
+    parser.add_argument("--texts", help="alternate text set, one text per line, 'name=content' allowed")
+    args = parser.parse_args()
+    return run(args)
+
 
 class VerifierArgumentParser(argparse.ArgumentParser):
     def error(self, message):
         self.print_usage(sys.stderr)
         print("error: %s" % message, file=sys.stderr)
         sys.exit(1)
+
 
 def selftest():
     results = []
@@ -453,18 +698,40 @@ def selftest():
     check("non-dict body yields None", lambda: parse_usage_tokens(None) is None)
 
     # --- verdict selection (groups E+F+G, 12) ---
-    check("verdict 5/5 signature match", lambda: family_verdict(5) == "SIGNATURE MATCH")
-    check("verdict 4/5 is undecided", lambda: family_verdict(4) == "PARTIAL MATCH")
-    check("verdict 3/5 mismatch", lambda: family_verdict(3) == "SIGNATURE MISMATCH")
-    check("verdict 2/5 mismatch", lambda: family_verdict(2) == "SIGNATURE MISMATCH")
-    check("verdict 1/5 mismatch", lambda: family_verdict(1) == "SIGNATURE MISMATCH")
-    check("verdict 0/5 mismatch", lambda: family_verdict(0) == "SIGNATURE MISMATCH")
+    check("verdict 5/5 signature match", lambda: family_verdict(5, 5) == "SIGNATURE MATCH")
+    check("verdict 4/5 is undecided", lambda: family_verdict(4, 5) == "PARTIAL MATCH")
+    check("verdict 3/5 mismatch", lambda: family_verdict(3, 5) == "SIGNATURE MISMATCH")
+    check("verdict 2/5 mismatch", lambda: family_verdict(2, 5) == "SIGNATURE MISMATCH")
+    check("verdict 1/5 mismatch", lambda: family_verdict(1, 5) == "SIGNATURE MISMATCH")
+    check("verdict 0/5 mismatch", lambda: family_verdict(0, 5) == "SIGNATURE MISMATCH")
+    check("verdict 3/3 match", lambda: family_verdict(3, 3) == "SIGNATURE MATCH")
+    check("verdict 2/3 partial", lambda: family_verdict(2, 3) == "PARTIAL MATCH")
+    check("verdict 1/3 mismatch", lambda: family_verdict(1, 3) == "SIGNATURE MISMATCH")
+    check("verdict 4/4 match", lambda: family_verdict(4, 4) == "SIGNATURE MATCH")
+    check("verdict 3/4 partial", lambda: family_verdict(3, 4) == "PARTIAL MATCH")
+    check("verdict 2/4 mismatch", lambda: family_verdict(2, 4) == "SIGNATURE MISMATCH")
     check("moved control is unstable", lambda: is_unstable([5, 5, 7]))
     check("steady control is stable", lambda: not is_unstable([5, 5, 5]))
     check("decision: endpoint unavailable beats all", lambda: decide(endpoint_failed=True, usage_missing=True, unstable=True, family="openai", matches=5) == "ENDPOINT UNAVAILABLE")
     check("decision: no usage beats unstable", lambda: decide(usage_missing=True, unstable=True, family="openai", matches=5) == "NO USAGE REPORTED")
     check("decision: unstable beats family verdict", lambda: decide(unstable=True, family="openai", matches=5) == "UNSTABLE ACCOUNTING")
     check("decision: unmeasured family when no family", lambda: decide(family=None) == "UNMEASURED FAMILY")
+
+    # --- repeat stability and the unstable-text verdict rule ---
+    check("delta within tolerance is stable", lambda: not text_moved([14, 16], 14))
+    check("delta beyond tolerance is unstable", lambda: text_moved([14, 17], 14))
+    check("single repeat is stable", lambda: not text_moved([14], 14))
+    check("custom text requires exact repeat", lambda: text_moved([3, 4], None))
+    check("custom text exact repeat is stable", lambda: not text_moved([3, 3], None))
+    check("median keeps an integer", lambda: median_int([14, 15]) == 15)
+    check("median single value", lambda: median_int([14]) == 14)
+    check("3 match + 2 unstable is unstable accounting", lambda: family_verdict(3, 5, 2) == "UNSTABLE ACCOUNTING")
+    check("4 match + 1 unstable is partial", lambda: family_verdict(4, 5, 1) == "PARTIAL MATCH")
+    check("2 match + 1 unstable + 2 mismatch is mismatch", lambda: family_verdict(2, 5, 1) == "SIGNATURE MISMATCH")
+    check("3 match + 1 unstable + 1 mismatch is unstable", lambda: family_verdict(3, 5, 1) == "UNSTABLE ACCOUNTING")
+    check("decision: 4 match 1 unstable is partial", lambda: decide(family="deepseek", matches=4, total=5, unstable_texts=1) == "PARTIAL MATCH")
+    check("decision: 3 match 2 unstable is unstable", lambda: decide(family="deepseek", matches=3, total=5, unstable_texts=2) == "UNSTABLE ACCOUNTING")
+    check("decision: 2 match 1 unstable 2 mismatch is mismatch", lambda: decide(family="deepseek", matches=2, total=5, unstable_texts=1) == "SIGNATURE MISMATCH")
 
     # --- ladder, retries and the partial-run verdict (group I, 7) ---
     check("ladder starts at 64", lambda: MAX_TOKENS_LADDER[0] == 64)
@@ -475,50 +742,260 @@ def selftest():
     check("decision: incomplete beats unstable", lambda: decide(incomplete=True, unstable=True, family="openai", matches=5) == "PROBE INCOMPLETE")
     check("decision: endpoint beats incomplete", lambda: decide(endpoint_failed=True, incomplete=True) == "ENDPOINT UNAVAILABLE")
 
+    # --- key handling and request estimates ---
+    check("--key is detected", lambda: reject_key_argv(["--key", "secret"]))
+    check("--key=VALUE is detected", lambda: reject_key_argv(["--key=secret"]))
+    check("--key-stdin is not rejected", lambda: not reject_key_argv(["--key-stdin"]))
+    check("estimate one repeat", lambda: estimate_run_requests(5, 1) == 6)
+    check("estimate two repeats", lambda: estimate_run_requests(5, 2) == 12)
+    check("budget starts unlimited", lambda: RequestBudget(0).limit == 0)
+    check("budget counts attempts", lambda: _budget_used(3) == 3)
+
+    def read_stdin_key(value):
+        old = sys.stdin
+        sys.stdin = io.StringIO(value)
+        try:
+            return read_key(argparse.Namespace(key_stdin=True))
+        finally:
+            sys.stdin = old
+
+    check("key from stdin", lambda: read_stdin_key("sk-test\n") == ("sk-test", None))
+    check("empty key from stdin is rejected", lambda: read_stdin_key("\n")[0] is None)
+
+    def reject_flag(flag):
+        old = sys.argv
+        sys.argv = ["verify_gateway.py", flag, "secret"]
+        err = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(err):
+                code = main()
+        finally:
+            sys.argv = old
+        return code == 1 and "process list" in err.getvalue() and "secret" not in err.getvalue()
+
+    check("--key exits before any request", lambda: reject_flag("--key"))
+    check("--key=VALUE exits before any request", lambda: reject_flag("--key=secret"))
+
+    # --- redirect guard ---
+    def cross_host_redirect_refused():
+        handler = SafeRedirectHandler()
+        req = urllib.request.Request("http://a.example/v1/chat/completions")
+        try:
+            handler.redirect_request(req, None, 302, "Found", {}, "http://b.example/steal")
+            return False
+        except ProbeFailure as e:
+            return "different host" in str(e) and "secret" not in str(e)
+
+    def same_host_redirect_allowed():
+        handler = SafeRedirectHandler()
+        req = urllib.request.Request("http://a.example/v1/chat/completions")
+        return isinstance(handler.redirect_request(req, None, 302, "Found", {},
+                                                   "http://a.example/v1/messages"),
+                          urllib.request.Request)
+
+    check("cross-host redirect is refused", cross_host_redirect_refused)
+    check("same-host redirect is allowed", same_host_redirect_allowed)
+
     # --- report safety & shape (group H, 2) ---
     sentinel = "sk-sentinel-never-in-report"
     report = build_report("https://gw.example.com/v1", "m", "openai", [5], [], "openai",
-                          [24, 24, 22, 30, 29], 5, "SIGNATURE MATCH", "note")
+                          [24, 24, 22, 30, 29], 5, "SIGNATURE MATCH", "note",
+                          total_texts=5, unstable_texts=[])
     report_json = json.dumps(report)
     check("key material never appears in report", lambda: sentinel not in report_json and "key" not in report)
     check("report carries tool and version", lambda: report["tool"] == TOOL and report["version"] == VERSION)
+    check("report stores control repeats", lambda: report["control"]["repeats"] == [5])
+    check("report stores text total", lambda: report["texts_total"] == 5)
+
+    # --- local mock gateway, no real network ---
+    def start_gateway(scenario, signature=(14, 20, 18, 27, 22)):
+        state = {"control": 0, "counts": {}}
+
+        def base_token(text):
+            if scenario == "constant":
+                return 42
+            if text == CONTROL_TEXT:
+                if scenario == "drifting_control":
+                    state["control"] += 1
+                    return 4 + state["control"]
+                return 5
+            for i, (_, probe) in enumerate(PROBES):
+                if text == probe:
+                    if scenario == "rounded":
+                        # Coarse 5-token buckets: every reading is a multiple of 5,
+                        # and the deltas no longer line up with the family.
+                        return 30
+                    if scenario == "shift_t1" and i == 0:
+                        return 45
+                    tok = 5 + signature[i]
+                    if scenario in ("drifting_text", "drifting_two_texts") and i < (1 if scenario == "drifting_text" else 2):
+                        state["counts"][text] = state["counts"].get(text, 0) + 1
+                        if state["counts"][text] >= 2:
+                            tok += 3
+                    return tok
+            return 5 + max(1, len(text) // 4)
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def send_json(self, code, obj):
+                raw = json.dumps(obj).encode("utf-8")
+                try:
+                    self.send_response(code)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(raw)))
+                    self.end_headers()
+                    self.wfile.write(raw)
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+                    pass
+
+            def do_POST(self):
+                try:
+                    length = int(self.headers.get("Content-Length") or 0)
+                    payload = json.loads(self.rfile.read(length) or b"{}")
+                except Exception:
+                    payload = {}
+                if scenario == "payment":
+                    self.send_json(402, {"error": "payment required"})
+                    return
+                if scenario == "cross_host_redirect":
+                    try:
+                        self.send_response(302)
+                        self.send_header("Location", "http://example.invalid/steal")
+                        self.end_headers()
+                    except (BrokenPipeError, ConnectionResetError):
+                        pass
+                    return
+                if scenario == "anthropic_only" and self.path.endswith("/chat/completions"):
+                    self.send_json(404, {"error": "not found"})
+                    return
+                if scenario == "timeout":
+                    time.sleep(0.3)
+                try:
+                    text = payload["messages"][0]["content"]
+                except Exception:
+                    text = ""
+                token = base_token(text)
+                body = {
+                    "model": payload.get("model", "mock-model"),
+                    "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+                }
+                if scenario != "no_usage":
+                    if self.path.endswith("/messages"):
+                        body["usage"] = {"input_tokens": token}
+                    else:
+                        body["usage"] = {"prompt_tokens": token}
+                self.send_json(200, body)
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        server.daemon_threads = True
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        return server, "http://127.0.0.1:%d/v1" % server.server_port
+
+    def stop_gateway(server):
+        server.shutdown()
+        server.server_close()
+
+    def args_for(base, **overrides):
+        defaults = {
+            "base": base,
+            "model": "deepseek/deepseek-v4.1-flash-1017",
+            "key_stdin": False,
+            "sleep": 0,
+            "timeout": 5,
+            "repeat": 1,
+            "max_requests": 0,
+            "out": None,
+            "texts": None,
+        }
+        defaults.update(overrides)
+        return argparse.Namespace(**defaults)
+
+    def run_capture(args):
+        out = io.StringIO()
+        err = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = run(args, api_key="selftest-key")
+        return code, out.getvalue() + err.getvalue()
+
+    def scenario_run(scenario, **overrides):
+        server, base = start_gateway(scenario)
+        try:
+            return run_capture(args_for(base, **overrides))
+        finally:
+            stop_gateway(server)
+
+    code, out = scenario_run("honest")
+    check("mock honest gateway yields signature match", lambda: code == 0 and "verdict: SIGNATURE MATCH" in out)
+    check("mock honest gateway scores all texts", lambda: "matches: 5/5" in out)
+    check("run prints request estimate", lambda: "estimated requests: 6" in out)
+
+    code, out = scenario_run("constant")
+    check("mock constant usage yields mismatch", lambda: "verdict: SIGNATURE MISMATCH" in out and "matches: 0/5" in out)
+
+    code, out = scenario_run("rounded")
+    check("mock rounded usage yields mismatch", lambda: "verdict: SIGNATURE MISMATCH" in out)
+
+    code, out = scenario_run("shift_t1")
+    check("mock one shifted text yields partial", lambda: "verdict: PARTIAL MATCH" in out and "matches: 4/5" in out)
+
+    code, out = scenario_run("anthropic_only")
+    check("404 on openai dialect falls back to anthropic", lambda: "dialect: anthropic" in out and "verdict: SIGNATURE MATCH" in out)
+
+    code, out = scenario_run("no_usage")
+    check("mock no usage yields no usage verdict", lambda: "verdict: NO USAGE REPORTED" in out)
+
+    code, out = scenario_run("payment")
+    check("mock 402 yields endpoint unavailable", lambda: "verdict: ENDPOINT UNAVAILABLE" in out)
+
+    code, out = scenario_run("cross_host_redirect")
+    check("mock cross-host redirect yields endpoint unavailable", lambda: "verdict: ENDPOINT UNAVAILABLE" in out and "redirect" in out)
+
+    global FAST_SLEEP
+    old_fast = FAST_SLEEP
+    FAST_SLEEP = True
+    try:
+        code, out = scenario_run("timeout", timeout=0.05)
+    finally:
+        FAST_SLEEP = old_fast
+    check("mock timeout yields endpoint unavailable", lambda: "verdict: ENDPOINT UNAVAILABLE" in out)
+
+    code, out = scenario_run("drifting_control", repeat=2)
+    check("mock drifting control yields unstable accounting", lambda: "verdict: UNSTABLE ACCOUNTING" in out)
+
+    code, out = scenario_run("drifting_text", repeat=2)
+    check("mock one drifting text yields partial", lambda: "verdict: PARTIAL MATCH" in out and "match=unstable" in out)
+
+    code, out = scenario_run("drifting_two_texts", repeat=2)
+    check("mock two drifting texts yield unstable accounting", lambda: "verdict: UNSTABLE ACCOUNTING" in out and "matches: 3/5" in out)
+
+    code, out = scenario_run("honest", max_requests=2)
+    check("mock request budget yields probe incomplete", lambda: "verdict: PROBE INCOMPLETE" in out and "budget" in out)
 
     total = len(results)
     failed = [d for d, ok in results if not ok]
     passed = total - len(failed)
 
-    if total != 61:
-        print("SELFTEST (v3.0): internal error, expected 61 assertions, ran %d" % total, file=sys.stderr)
+    if total != 111:
+        print("SELFTEST (v3.1): internal error, expected 111 assertions, ran %d" % total, file=sys.stderr)
         return 2
     if failed:
         for d in failed:
             print("FAIL: %s" % d, file=sys.stderr)
-        print("SELFTEST (v3.0): %d passed, %d failed" % (passed, len(failed)))
+        print("SELFTEST (v3.1): %d passed, %d failed" % (passed, len(failed)))
         return 2
-    print("SELFTEST (v3.0): 61 passed, 0 failed")
+    print("SELFTEST (v3.1): %d passed, 0 failed" % total)
     return 0
 
-def main():
-    # never let a non-ASCII probe name kill output on a legacy console codepage
-    if hasattr(sys.stdout, "reconfigure"):
-        sys.stdout.reconfigure(errors="replace")
-        sys.stderr.reconfigure(errors="replace")
-    argv = sys.argv[1:]
-    if argv and argv[0] == "selftest":
-        return selftest()
 
-    parser = VerifierArgumentParser(
-        description="Model-authenticity verifier: input-side tokenizer diff against measured family signatures.")
-    parser.add_argument("--base", help="base URL of the gateway, e.g. https://gw.example.com/v1")
-    parser.add_argument("--model", help="model id to check, e.g. anthropic/claude-opus-4.8")
-    parser.add_argument("--key", help="API key; falls back to env VERIFY_API_KEY. Never printed or stored.")
-    parser.add_argument("--sleep", type=float, default=2, help="seconds between requests (default 2)")
-    parser.add_argument("--timeout", type=float, default=60, help="per-request timeout in seconds (default 60)")
-    parser.add_argument("--repeat", type=int, default=1, help="repeat the probe set N times (default 1)")
-    parser.add_argument("--out", help="write the full JSON report to FILE")
-    parser.add_argument("--texts", help="alternate text set, one text per line, 'name=content' allowed")
-    args = parser.parse_args()
-    return run(args)
+def _budget_used(count):
+    budget = RequestBudget(count)
+    for _ in range(count):
+        budget.acquire()
+    return budget.used
+
 
 if __name__ == "__main__":
     sys.exit(main())

@@ -4,7 +4,7 @@
 
 **Is the model behind that gateway really what the label says?**
 
-![version](https://img.shields.io/badge/skill-v3.0-1f6feb)
+![version](https://img.shields.io/badge/skill-v3.1-1f6feb)
 ![python](https://img.shields.io/badge/python-stdlib%20only-3776AB?logo=python&logoColor=white)
 ![license](https://img.shields.io/badge/license-MIT-2ea44f)
 
@@ -41,9 +41,15 @@ That is the whole method. One probe family, one comparison, one verdict.
 - Reads `usage.input_tokens` or `usage.prompt_tokens`
 - Computes `delta(T) = tokens(T) - tokens("a")` per text, which cancels the
   path's template and system-prompt overhead
-- Compares the five deltas against the measured reference signature of the
+- With `--repeat`, stores every repeat per text and reports the repeat
+  values, min/max, and a `text_unstable` flag. An unstable text is not scored
+  as a match or a mismatch; it stays in the N denominator and is counted in
+  the note
+- Compares the deltas against the measured reference signature of the
   claimed family, per text, with tolerance
   `max(2, ceil(0.08 * reference))`
+- Prints an estimated request count before the run; `--max-requests` stops
+  the run and reports `PROBE INCOMPLETE` when the budget is exhausted
 - Prints a verdict and a full JSON report. The key is never printed and
   never written to the report
 
@@ -62,7 +68,9 @@ VERIFY_API_KEY=sk-... python scripts/verify_gateway.py \
     --model "anthropic/claude-opus-4.8"
 ```
 
-On Windows use `python` instead of `python3`; set the key with
+The key comes from `VERIFY_API_KEY` or from one line on stdin with
+`--key-stdin`. `--key` is refused: command-line arguments are visible in the
+process list. On Windows use `python` instead of `python3`; set the key with
 `$env:VERIFY_API_KEY = "sk-..."`. Offline logic check (no network):
 `python scripts/verify_gateway.py selftest`.
 
@@ -95,18 +103,22 @@ accounting) and maps to no family: `UNMEASURED FAMILY`.
 
 | Verdict | Meaning |
 |---|---|
-| `SIGNATURE MATCH` | 5 of 5 texts agree with the claimed family's reference signature. WEAK FOR: same tokenizer dialect, not proof of weights. |
-| `PARTIAL MATCH` | 4 of 5 agree. One text that misses is an anomaly, not a family split: re-run with fresh texts before concluding anything. |
-| `SIGNATURE MISMATCH` | 3 or fewer agree. The tokenizer does not look like the claimed family's. |
+| `SIGNATURE MATCH` | All N texts agree with the claimed family's reference signature. WEAK FOR: same tokenizer dialect, not proof of weights. |
+| `PARTIAL MATCH` | Exactly N-1 agree. One text that misses is an anomaly, not a family split: re-run with fresh texts before concluding anything. |
+| `SIGNATURE MISMATCH` | N-2 or fewer agree and at least two stably measured texts miss. The tokenizer does not look like the claimed family's. If unstable texts leave fewer than two stable misses, the result is `UNSTABLE ACCOUNTING`. |
 | `UNMEASURED FAMILY` | no reference signature for the claimed model. The deltas are reported raw so they can be baselined later. |
-| `UNSTABLE ACCOUNTING` | the control's token count moved between repeats (`--repeat` > 1). The route's usage accounting is not stable, so no conclusion is drawn. |
+| `UNSTABLE ACCOUNTING` | the control's token count moved between repeats, or unstable texts leave fewer than two stably measured misses (`--repeat` > 1). The route's usage accounting is not stable, so no conclusion is drawn. |
 | `PROBE INCOMPLETE` | the route answered but some texts could not be measured. The deltas are partial, so no family verdict is drawn. Re-run. |
 | `ENDPOINT UNAVAILABLE` | the endpoint did not answer usefully: timeout, refusal or an HTTP error. The note carries the status. Dead is not fake, and neither is a refusal. |
 | `NO USAGE REPORTED` | responses carried no token usage, so the method could not run. |
 
 Decision order: endpoint unavailable > no usage reported > probe incomplete >
 unstable accounting > family verdict. A text matches its reference when
-`abs(delta - reference) <= max(2, ceil(0.08 * reference))`.
+`abs(delta - reference) <= max(2, ceil(0.08 * reference))`. A text is
+`unstable` when its delta range across repeats exceeds that tolerance (exact
+equality when there is no reference). Unstable texts stay in the N
+denominator and are counted in the note; a mismatch needs at least two
+stably measured misses.
 
 ## The probe texts
 
@@ -149,7 +161,9 @@ T5 arab+misc:
   (siblings 45) are the known cases.
 - **Unstable accounting invalidates a run (R5).** `deepseek-v4-flash` is the
   known case: control "a" moved 22 -> 5 -> 31 across runs and max_tokens.
-  It maps to `UNMEASURED FAMILY`.
+  It maps to `UNMEASURED FAMILY`. A text that moves across repeats is not
+  evidence for either side: it is reported as `unstable`, stays in the
+  denominator, and cannot by itself produce `SIGNATURE MISMATCH`.
 - **Parameter-independent modifications degrade fingerprints** (wrappers,
   system prompts, RAG; see `references/methodology.md`). A mismatch is a
   reason to investigate, never a conviction.
