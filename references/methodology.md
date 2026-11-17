@@ -268,7 +268,47 @@ case-insensitive). A differing echo is recorded as a side-evidence note
 only (R1); side evidence alone never changes a verdict. Headers pass
 through the same budget-counted responses as everything else.
 
+## The tolerance rule: formula and origin
+
+The tolerance is implemented as
+`tolerance(reference) = max(2, ceil(0.08 * reference))`
+and is applied in two places:
+
+- `text_matches`: a text agrees with its reference when
+  `abs(delta - reference) <= max(2, ceil(0.08 * reference))`, i.e.
+  `tolerance(reference)` against `|delta - reference|`.
+- The linearity residual check in the consistency suite: a unit is flagged
+  `usage_suspect` when its max residual exceeds `tolerance(max(deltas))`,
+  i.e. `max(2, ceil(0.08 * max(deltas)))`.
+
+Both uses call the same function; there is one formula, not two.
+
+Where the mock values come from (synthetic gates, not measurements of real
+endpoints):
+
+- honest ascii: slope 3, max delta at k=8 is 3*8 = 24, so
+  max(2, ceil(0.08 * 24)) = max(2, ceil(1.92)) = 2
+- honest cjk: slope 2, max delta at k=8 is 2*8 = 16, so
+  max(2, ceil(0.08 * 16)) = max(2, ceil(1.28)) = 2
+- honest emoji: slope 4, max delta at k=8 is 4*8 = 32, so
+  max(2, ceil(0.08 * 32)) = max(2, ceil(2.56)) = 3
+- quadratic (5 + 4k + 3k^2): max delta at k=8 is 4*8 + 3*64 = 224, so
+  max(2, ceil(0.08 * 224)) = max(2, ceil(17.92)) = 18; the observed max
+  residual is 19.714, which exceeds the tolerance band by 1.714. The
+  quadratic scenario sits only ~9.5% above the band, i.e. the margin is
+  thin. It is sufficient for the synthetic case because the mock is a
+  fixed, known function (5 + 4k + 3k^2) and the check only needs a stable
+  flag on a deterministic series; it is not a claim about real endpoints,
+  where the residual distribution is unknown.
+
+**Explicit status:** belum dikalibrasi terhadap endpoint nyata. The 8%
+factor and the floor of 2 are engineering defaults, not measured constants.
+No real endpoint was tested for this rule. Real routes may need calibration
+once a real run exists; the constants should be revisited then, not before.
+Nothing in this section reports a measurement taken on a real endpoint.
+
 ## The fingerprint-degradation caveat (arXiv 2508.19843)
+
 
 The SoK on LLM copyright auditing via fingerprinting introduces LeaFBench
 (149 model instances, 13 post-development techniques, including

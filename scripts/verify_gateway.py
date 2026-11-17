@@ -9,6 +9,7 @@ import io
 import json
 import math
 import os
+import re
 import statistics
 import sys
 import tempfile
@@ -131,6 +132,15 @@ class SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
+def _normalize_version_sep(s):
+    """Treat "." and "-" as equivalent inside version numbers: collapse either
+    to "-" when it sits between two digits. Other characters (including "_")
+    are untouched, so "deepseek-v4_1" style ids are unaffected. Applied to both
+    the stored keys and the incoming model id, so "claude-sonnet-4-6" and
+    "claude-sonnet-4.6" match the same family."""
+    return re.sub(r"(?<=\d)[.-](?=\d)", "-", s)
+
+
 def _family_keys():
     keys = []
     for family, models in _MODEL_KEYS.items():
@@ -141,13 +151,13 @@ def _family_keys():
     # de-dup, longest key first so specific keys beat generic ones
     seen = {}
     for key, family in keys:
-        seen[key.lower()] = family
+        seen[_normalize_version_sep(key.lower())] = family
     out = sorted(seen.items(), key=lambda kv: len(kv[0]), reverse=True)
     return out
 
 
 def map_family(model_id):
-    mid = (model_id or "").lower()
+    mid = _normalize_version_sep((model_id or "").lower())
     for key, family in _family_keys():
         if key in mid:
             return family
@@ -448,6 +458,33 @@ def cache_fields_seen(body):
     if not isinstance(usage, dict):
         return False
     return ("cache_read_input_tokens" in usage) or ("cache_creation_input_tokens" in usage)
+
+
+def cache_token_fields(body):
+    """Cache-token fields the response carries, field name -> int.
+
+    Same fail-closed rules as usage_units: only non-negative ints are accepted
+    (booleans, floats and negatives are rejected). Only the fields actually
+    present and valid are recorded. Cached tokens are never added to any
+    delta; this dict is recorded in the ledger for visibility only.
+    """
+    fields = {}
+    if not isinstance(body, dict):
+        return fields
+    usage = body.get("usage")
+    if not isinstance(usage, dict):
+        return fields
+    for key in ("cache_read_input_tokens", "cache_creation_input_tokens"):
+        if key in usage:
+            value = _usage_int(usage[key])
+            if value is not None:
+                fields[key] = value
+    details = usage.get("prompt_tokens_details")
+    if isinstance(details, dict) and "cached_tokens" in details:
+        value = _usage_int(details["cached_tokens"])
+        if value is not None:
+            fields["cached_tokens"] = value
+    return fields
 
 
 COMPARABLE_UNITS = ("input_tokens", "prompt_tokens", "total_minus_output")
@@ -899,13 +936,20 @@ def _budget_note(suite, budget, err=None):
 
 
 def run_consistency_suite(base, model, key, dialect_holder, timeout, sleep, budget,
-                          stream=False):
+                          stream=False, cache_fields_out=None):
     """Consistency suite. Notes only: results are appended to the report and
     printed, never used to pick or change a verdict (R1). Every HTTP attempt
-    passes through the shared RequestBudget."""
+    passes through the shared RequestBudget. cache_fields_out, when given,
+    collects the names of cache token fields seen in any response body."""
     suite = {"linearity": {}, "determinism": {}, "side_evidence": {}, "notes": []}
     if stream:
         suite["stream"] = {}
+
+    def observe_cache(body):
+        if cache_fields_out is None:
+            return
+        for name in cache_token_fields(body):
+            cache_fields_out.append(name)
 
     # --- control once, same path as everything else; headers ride on this one ---
     try:
@@ -915,6 +959,7 @@ def run_consistency_suite(base, model, key, dialect_holder, timeout, sleep, budg
         _budget_note(suite, budget, e)
         return suite
     control_tokens = ctrl["usage_tokens"]
+    observe_cache(ctrl.get("body"))
     if control_tokens is None:
         suite["notes"].append("consistency: control response carried no token usage; the consistency suite could not run")
         return suite
@@ -954,6 +999,7 @@ def run_consistency_suite(base, model, key, dialect_holder, timeout, sleep, budg
             except ProbeFailure as e:
                 _budget_note(suite, budget, e)
                 return suite
+            observe_cache(resp.get("body"))
             tok = resp["usage_tokens"]
             if tok is None:
                 suite["notes"].append("consistency: response carried no token usage (unit %s, k=%d); the linearity check was skipped for this unit" % (unit_name, k))
@@ -1001,6 +1047,7 @@ def run_consistency_suite(base, model, key, dialect_holder, timeout, sleep, budg
         except ProbeFailure as e:
             _budget_note(suite, budget, e)
             return suite
+        observe_cache(resp.get("body"))
         tok = resp["usage_tokens"]
         if tok is None:
             suite["notes"].append("consistency: response carried no token usage (determinism, unit %s); the determinism check was skipped" % det_unit)
@@ -1023,6 +1070,7 @@ def run_consistency_suite(base, model, key, dialect_holder, timeout, sleep, budg
         try:
             resp = _consistency_request(base, model, key, stream_text, dialect_holder,
                                         timeout, budget, stream=False)
+            observe_cache(resp.get("body"))
             ns_tokens = resp["usage_tokens"]
         except ProbeFailure as e:
             if budget.exceeded:
@@ -1177,7 +1225,8 @@ def build_report(base, model, dialect, control_tokens_list, probe_results, famil
                  signature, matches, verdict, note, failed_probes=None,
                  total_texts=None, unstable_texts=None, budget=None,
                  estimated_requests=None, baseline=None, control_units=None,
-                 consistency=None):
+                 consistency=None, family_source="mapped", family_requested=None,
+                 control_cache_tokens=None):
     control_unstable = (len(control_tokens_list) > 1 and is_unstable(control_tokens_list))
     if family:
         reference = {"family": family, "signature": signature}
@@ -1198,6 +1247,8 @@ def build_report(base, model, dialect, control_tokens_list, probe_results, famil
         "model": model,
         "started": datetime.now().astimezone().isoformat(timespec="seconds"),
         "dialect": dialect,
+        "family_source": family_source,
+        "family_requested": family_requested,
         "control": {
             "text": CONTROL_TEXT,
             "tokens": control_tokens_list[0] if control_tokens_list else None,
@@ -1206,6 +1257,7 @@ def build_report(base, model, dialect, control_tokens_list, probe_results, famil
             "max": max(control_tokens_list) if control_tokens_list else None,
             "unstable": control_unstable,
             "units": list(control_units or []),
+            "cache_tokens": list(control_cache_tokens) if control_cache_tokens is not None else [],
         },
         "reference": reference,
         "probes": probe_results,
@@ -1271,6 +1323,16 @@ def run(args, api_key=None):
         print("error: %s" % e, file=sys.stderr)
         return 1
 
+    # --family NAME skips family mapping entirely and uses NAME. Fail closed:
+    # an unknown name is an error before any request, never a silent fallback.
+    family_override = getattr(args, "family", None)
+    if family_override is not None:
+        if family_override not in active_baselines:
+            known = ", ".join(sorted(active_baselines)) or "none"
+            print("error: --family %r is not an active baseline family; known families: %s" % (
+                family_override, known), file=sys.stderr)
+            return 1
+
     custom_texts = bool(args.texts)
     if custom_texts:
         try:
@@ -1284,7 +1346,14 @@ def run(args, api_key=None):
     else:
         texts = PROBES
 
-    family = None if custom_texts else map_family(args.model)
+    if family_override is not None:
+        family = family_override
+    elif custom_texts:
+        family = None
+    else:
+        family = map_family(args.model)
+    family_source = "user-supplied" if family_override is not None else "mapped"
+    family_requested = family_override
     baseline = active_baselines.get(family) if family else None
     signature = baseline["signature"] if baseline else None
     n_texts = len(texts)
@@ -1310,8 +1379,11 @@ def run(args, api_key=None):
     tokens_by_name = {name: [] for name, _ in texts}
     control_units_by_rep = []
     control_cache_by_rep = []
+    control_cache_tokens = []
     probe_units_by_name = {name: [] for name, _ in texts}
     probe_cache_by_name = {name: [] for name, _ in texts}
+    probe_cache_tokens = {name: [] for name, _ in texts}
+    suite_cache_fields = []
     endpoint_error = None
     usage_missing = False
     failed_probes = []
@@ -1335,6 +1407,7 @@ def run(args, api_key=None):
         control_tokens_all.append(ctrl_tok)
         control_units_by_rep.append(usage_units(ctrl_body))
         control_cache_by_rep.append(cache_fields_seen(ctrl_body))
+        control_cache_tokens.append(cache_token_fields(ctrl_body))
         pause(args.sleep)
         for i, (name, text) in enumerate(texts):
             try:
@@ -1346,16 +1419,19 @@ def run(args, api_key=None):
                     break
                 probe_units_by_name[name].append(None)
                 probe_cache_by_name[name].append(None)
+                probe_cache_tokens[name].append(None)
                 failed_probes.append("%s (%s)" % (name, e))
                 continue
             tok = parse_usage_tokens(body)
             if tok is None:
                 probe_units_by_name[name].append(None)
                 probe_cache_by_name[name].append(None)
+                probe_cache_tokens[name].append(cache_token_fields(body))
                 failed_probes.append("%s (no token usage in the response)" % name)
                 continue
             probe_units_by_name[name].append(usage_units(body))
             probe_cache_by_name[name].append(cache_fields_seen(body))
+            probe_cache_tokens[name].append(cache_token_fields(body))
             tokens_by_name[name].append((rep, tok))
             if i < len(texts) - 1 or rep < args.repeat - 1:
                 pause(args.sleep)
@@ -1373,7 +1449,8 @@ def run(args, api_key=None):
     if with_consistency:
         consistency_suite = run_consistency_suite(
             args.base, args.model, key, dialect_holder,
-            args.timeout, args.sleep, budget, stream=stream)
+            args.timeout, args.sleep, budget, stream=stream,
+            cache_fields_out=suite_cache_fields)
         dialect = dialect_holder[0]
         consistency["linearity"] = consistency_suite["linearity"]
         consistency["determinism"] = consistency_suite["determinism"]
@@ -1391,6 +1468,8 @@ def run(args, api_key=None):
             ref = signature[idx] if signature and idx < len(signature) else None
             unit_entries = probe_units_by_name[name]
             first_units = next((u for u in unit_entries if u is not None), {})
+            cache_entries = probe_cache_tokens[name]
+            first_cache = next((c for c in cache_entries if c is not None), {})
             tokens_repeats = [tok for _, tok in pairs]
             deltas = [tok - control_tokens_all[rep] for rep, tok in pairs if rep < len(control_tokens_all)]
             unstable_text = text_moved(deltas, ref)
@@ -1420,6 +1499,7 @@ def run(args, api_key=None):
                 "status": status,
                 "chars": len(text),
                 "units": first_units,
+                "cache_tokens": first_cache,
             })
         if signature and not control_unstable and not failed_probes and not budget_stopped:
             matches = sum(1 for p in probe_results if p["status"] == "match")
@@ -1495,6 +1575,14 @@ def run(args, api_key=None):
                 note += "; control %d is outside the recorded control range [%d,%d] for %s; recorded as a note only, the verdict is unchanged (R2)" % (
                     first_control, cr[0], cr[1], baseline["family"])
 
+    cache_dicts = control_cache_tokens + [c for entries in probe_cache_tokens.values() for c in entries]
+    seen_cache_fields = [k for k in ("cache_read_input_tokens", "cache_creation_input_tokens", "cached_tokens")
+                         if k in suite_cache_fields or any(d and k in d for d in cache_dicts)]
+    if seen_cache_fields:
+        note += "; response usage reported cache token fields (%s); input token counts may exclude cached tokens; recorded as a note only, the verdict is unchanged (R1)" % ", ".join(seen_cache_fields)
+    if family_override is not None:
+        note += "; family supplied by the user, not derived from the model id; recorded as provenance only, the verdict is unchanged (R1)"
+
     if consistency["usage_suspect"] and verdict not in ("ENDPOINT UNAVAILABLE", "NO USAGE REPORTED"):
         note = ("warning: every delta in every unit is a multiple of 5, so a mismatch can come "
                 "from rounded or synthesized usage rather than from the tokenizer; ") + note
@@ -1506,7 +1594,10 @@ def run(args, api_key=None):
                           total_texts=n_texts, unstable_texts=unstable_texts,
                           budget=budget, estimated_requests=report_estimated,
                           baseline=baseline, control_units=control_units_by_rep,
-                          consistency=consistency)
+                          consistency=consistency,
+                          family_source=family_source,
+                          family_requested=family_requested,
+                          control_cache_tokens=control_cache_tokens)
 
     print("base: %s" % args.base)
     print("model: %s" % args.model)
@@ -1611,6 +1702,7 @@ def main():
                         help="stop after N HTTP requests and report PROBE INCOMPLETE (default 0 = unlimited)")
     parser.add_argument("--out", help="write the full JSON report to FILE")
     parser.add_argument("--texts", help="alternate text set, one text per line, 'name=content' allowed")
+    parser.add_argument("--family", help="use NAME as the claimed family instead of deriving it from the model id; NAME must be an active baseline family or the run fails closed")
     parser.add_argument("--with-consistency", action="store_true",
                         help="after the probe run, also run the consistency suite and report it (notes only, the family verdict is unchanged)")
     parser.add_argument("--stream", action="store_true",
@@ -1671,6 +1763,36 @@ def selftest():
     check("family keys sorted longest first", lambda: [len(k) for k, _ in _family_keys()] == sorted((len(k) for k, _ in _family_keys()), reverse=True))
     check("opus-4.7 does not map to 4.6", lambda: map_family("anthropic/claude-opus-4.7") == "anthropic-core")
     check("unknown model maps to no family", lambda: map_family("totally-unknown-model") is None)
+
+    # --- model-id normalization (pre-flight) ---
+    check("dotted and dashed sonnet-4.6 map to the same family", lambda: (
+        map_family("claude-sonnet-4-6") == map_family("anthropic/claude-sonnet-4.6") == "anthropic-4.6"))
+    check("dotted and dashed deepseek id map to the same family", lambda: (
+        map_family("deepseek/deepseek-v4-1-flash-1017") == map_family("deepseek/deepseek-v4.1-flash-1017") == "deepseek"))
+
+    def official_ids_map_to_own_family():
+        return all(map_family(m) == fam
+                   for fam, models in _MODEL_KEYS.items()
+                   for m in models)
+    check("every official id in _MODEL_KEYS still maps to its own family", official_ids_map_to_own_family)
+    check("unknown dotted id maps to no family", lambda: map_family("acme/mystery-9") is None)
+
+    # --- cache token fields (pure function, pre-flight) ---
+    check("cache_token_fields captures present valid fields", lambda: cache_token_fields(
+        {"usage": {"input_tokens": 10, "cache_read_input_tokens": 3,
+                   "prompt_tokens_details": {"cached_tokens": 2}}}) == {"cache_read_input_tokens": 3, "cached_tokens": 2})
+    check("cache_token_fields rejects boolean, float and negative values", lambda: cache_token_fields(
+        {"usage": {"cache_read_input_tokens": True,
+                   "cache_creation_input_tokens": 1.5,
+                   "prompt_tokens_details": {"cached_tokens": -1}}}) == {})
+    check("cache_token_fields captures cache_creation_input_tokens", lambda: cache_token_fields(
+        {"usage": {"input_tokens": 10, "cache_creation_input_tokens": 6}}) == {"cache_creation_input_tokens": 6})
+    check("usage_units keeps the non-cache units only", lambda: (
+        lambda u: u.get("input_tokens") == 10
+        and "cache_read_input_tokens" not in u
+        and "cached_tokens" not in u)(
+        usage_units({"usage": {"input_tokens": 10, "cache_read_input_tokens": 3,
+                               "prompt_tokens_details": {"cached_tokens": 2}}})))
 
     # --- usage parsing (group D, 8) ---
     check("parse openai prompt_tokens", lambda: parse_usage_tokens({"usage": {"prompt_tokens": 12}}) == 12)
@@ -2138,6 +2260,12 @@ def selftest():
                         body["usage"] = {"input_tokens": token}
                     else:
                         body["usage"] = {"prompt_tokens": token}
+                if scenario == "cache_fields":
+                    # usage carries input_tokens plus cache fields; cached tokens
+                    # are recorded in the ledger only, never in deltas.
+                    body["usage"] = {"input_tokens": token,
+                                     "cache_read_input_tokens": 3,
+                                     "prompt_tokens_details": {"cached_tokens": 2}}
                 if scenario in ("units_disagree", "units_varying"):
                     # prompt_tokens and total_minus_output both reported.
                     # units_disagree: they disagree by 7 on every response (constant offset).
@@ -2177,6 +2305,7 @@ def selftest():
             "max_requests": 0,
             "out": None,
             "texts": None,
+            "family": None,
             "with_consistency": False,
             "stream": False,
         }
@@ -2356,6 +2485,43 @@ def selftest():
         and rounded_report["consistency"]["quantization_k"] == 5))
     check("honest note has no usage_suspect", lambda: "usage_suspect" not in out_h)
 
+    # --- --family override and cache-token ledger (mock gateway, pre-flight) ---
+    def family_override_unknown_fails():
+        server, base = start_gateway("honest")
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                target = os.path.join(tmpdir, "report.json")
+                code, out = run_capture(args_for(base, family="bogus-family", out=target))
+                return code != 0 and not os.path.exists(target) and "bogus-family" in out
+        finally:
+            stop_gateway(server)
+    check("--family with an unknown name exits non-zero and writes no report", family_override_unknown_fails)
+
+    code_fo, out_fo = scenario_run("honest", family="deepseek")
+    fo_report = scenario_report("honest", family="deepseek")
+    check("--family with a valid name yields family_source user-supplied and family_requested set", lambda: (
+        fo_report["family_source"] == "user-supplied"
+        and fo_report["family_requested"] == "deepseek"
+        and fo_report["reference"]["family"] == "deepseek"))
+    check("--family note carries the provenance line", lambda: (
+        "family supplied by the user, not derived from the model id; recorded as provenance only, the verdict is unchanged (R1)" in out_fo))
+    check("--family verdict line identical to the mapped run", lambda: verdict_line(out_fo) == verdict_line(out_h))
+    check("mapped default records family_source mapped and null family_requested", lambda: (
+        honest_report["family_source"] == "mapped" and honest_report["family_requested"] is None))
+
+    code_cf, out_cf = scenario_run("cache_fields")
+    cf_report = scenario_report("cache_fields")
+    check("cache_fields ledger entry carries the cache tokens", lambda: (
+        cf_report["probes"][0]["cache_tokens"] == {"cache_read_input_tokens": 3, "cached_tokens": 2}
+        and cf_report["control"]["cache_tokens"] == [{"cache_read_input_tokens": 3, "cached_tokens": 2}]))
+    check("cache_fields note carries the cache-fields line", lambda: (
+        "response usage reported cache token fields (cache_read_input_tokens, cached_tokens); input token counts may exclude cached tokens; recorded as a note only, the verdict is unchanged (R1)" in out_cf))
+    check("cache_fields verdict line identical to the same mock without cache fields", lambda: (
+        verdict_line(out_cf) == verdict_line(out_h)))
+    check("honest ledger carries empty cache_tokens entries", lambda: (
+        all(p["cache_tokens"] == {} for p in honest_report["probes"])
+        and honest_report["control"]["cache_tokens"] == [{}]))
+
     # --- every HTTP attempt goes through the budget (counter proof) ---
     def budget_counter_case():
         calls = {"n": 0}
@@ -2414,6 +2580,10 @@ def selftest():
     check("every active probe_set_id matches probe_set_id()", lambda: bool(active_baselines) and all(
         b["probe_set_id"] == probe_set_id() for b in active_baselines.values()))
     check("active families are exactly deepseek and anthropic-4.6", lambda: sorted(active_baselines) == ["anthropic-4.6", "deepseek"])
+    check("every models list in the active baselines still maps to its own family", lambda: all(
+        map_family(m) == fam
+        for fam, b in active_baselines.items()
+        for m in b["models"]))
     check("deepseek active signature and confidence", lambda: (
         active_baselines["deepseek"]["signature"] == [14, 20, 18, 27, 22]
         and active_baselines["deepseek"]["confidence"] == "multi-route-third-party"))
@@ -2875,8 +3045,8 @@ def selftest():
     failed = [d for d, ok in results if not ok]
     passed = total - len(failed)
 
-    if total != 238:
-        print("SELFTEST (v3.1): internal error, expected 238 assertions, ran %d" % total, file=sys.stderr)
+    if total != 256:
+        print("SELFTEST (v3.1): internal error, expected 256 assertions, ran %d" % total, file=sys.stderr)
         return 2
     if failed:
         for d in failed:
