@@ -146,6 +146,34 @@ recorded in the file's provenance notes. Treat it as single-route,
 low-confidence evidence; every verdict that uses this baseline carries the
 single-route caveat.
 
+## Usage consistency (notes only)
+
+Responses report input-side token counts in more than one way. The collector
+records every input-side count the response carries (`input_tokens`,
+`prompt_tokens`, `total_minus_output` = `total_tokens` minus the completion
+or output tokens when both are reported and the result is not negative, and
+`input_plus_cache` = `input_tokens` plus the cache read/creation counts) and
+cross-checks them, per repeat, control vs probe. Only the first three are
+comparable; `input_tokens` is skipped for a response that reported cache
+units, because Anthropic excludes cached tokens from it. A response whose
+comparable units disagree, and any negative delta (probe below control on the
+same unit), are recorded as consistency failures in the note: a counting side
+that does not agree with itself is worth reporting, but it proves nothing
+about the weights, so it never changes the verdict (R1, R5).
+
+When every delta in every unit is a multiple of 5 and at least one delta
+exists, the note gains `usage_suspect`: the counts may be rounded or
+synthesized. The `quantization_k` reported next to it is the largest k in the
+ladder 1, 2, 3, 5, 8 that divides every delta in every unit; `quantization_k`
+is 0 when no deltas exist. Both are notes only and are appended for every
+outcome that reached a note, except `ENDPOINT UNAVAILABLE` and
+`NO USAGE REPORTED`, where no units exist to compare.
+
+Every HTTP attempt, including retries and the max_tokens ladder rungs, passes
+through the request budget (`--max-requests`). The estimated request count is
+printed before the run starts; it counts the control plus the texts per
+repeat and excludes retries and ladder rungs.
+
 ## The fingerprint-degradation caveat (arXiv 2508.19843)
 
 The SoK on LLM copyright auditing via fingerprinting introduces LeaFBench

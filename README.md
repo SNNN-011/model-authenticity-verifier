@@ -156,6 +156,30 @@ equality when there is no reference). Unstable texts stay in the N
 denominator and are counted in the note; a mismatch needs at least two
 stably measured misses.
 
+## Usage consistency
+
+The report carries a `consistency` block beside the verdict. It compares the
+input-side units a response reports, control vs probe: `input_tokens`,
+`prompt_tokens` and `total_minus_output` (`total_tokens` minus the completion
+or output tokens, when both are reported and the result is not negative).
+`input_tokens` is skipped for a response that reported cache units
+(`cache_read_input_tokens` / `cache_creation_input_tokens`), because cached
+tokens are excluded from it; `input_plus_cache` is recorded but never
+compared. A response where two or more comparable units are present and they
+differ is recorded as a disagreement. A negative delta (probe reports fewer
+tokens than the control on the same unit) is also recorded as a failure.
+
+Both of these are notes only. They are appended to the `note` string, never
+used to pick or change a verdict (R1, R5). When every delta in every unit is a
+multiple of 5 and at least one delta exists, the note gains `usage_suspect`
+with the quantization step: the largest k in the ladder 1, 2, 3, 5, 8 that
+divides every delta. `quantization_k` is 0 when there are no deltas.
+
+Every HTTP attempt, including retries and the max_tokens ladder rungs, passes
+through the request budget (`--max-requests`). The estimated request count is
+printed before the run starts; it counts the control plus the texts per
+repeat and does not include retries or ladder rungs.
+
 ## The probe texts
 
 Five family-dividing texts plus the control `a`. Plain repeated ASCII and

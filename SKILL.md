@@ -122,6 +122,23 @@ A text matches its reference when
 (exact equality when there is no reference). Unstable texts stay in the N
 denominator and are reported in the note, never silently dropped.
 
+## Usage consistency
+
+The report carries a `consistency` block. It compares the input-side units a
+response reports, control vs probe: `input_tokens`, `prompt_tokens` and
+`total_minus_output` (`total_tokens` minus the completion or output tokens,
+when both are reported and the result is not negative). `input_tokens` is
+skipped for a response that reported cache units, because cached tokens are
+excluded from it; `input_plus_cache` is recorded but never compared. A
+response whose comparable units differ, and any negative delta, are recorded
+as notes only: they are appended to the `note` string and never change the
+verdict (R1, R5). When every delta in every unit is a multiple of 5 (and at
+least one delta exists), the note gains `usage_suspect` with the
+`quantization_k`: the largest k in the ladder 1, 2, 3, 5, 8 dividing every
+delta; 0 when there are no deltas. Every HTTP attempt, retries and
+max_tokens ladder rungs included, passes through the request budget, and the
+estimated request count is printed before the run starts.
+
 ## What This Can and Cannot Show
 
 | Can show | Cannot show |

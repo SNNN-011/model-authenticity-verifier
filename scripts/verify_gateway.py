@@ -377,6 +377,185 @@ def parse_usage_tokens(body):
     return None
 
 
+def _usage_int(value):
+    if isinstance(value, bool):
+        return None
+    if not isinstance(value, int):
+        return None
+    if value < 0:
+        return None
+    return value
+
+
+def usage_units(body):
+    """Ordered input-side counts the response reports, unit name -> int.
+
+    Only ints >= 0 are accepted (booleans, floats and negatives are rejected).
+    Missing units are simply absent. input_plus_cache counts cached tokens on
+    top of input_tokens, which excludes them.
+    """
+    units = {}
+    if not isinstance(body, dict):
+        return units
+    usage = body.get("usage")
+    if not isinstance(usage, dict):
+        return units
+    inp = _usage_int(usage.get("input_tokens")) if "input_tokens" in usage else None
+    if inp is not None:
+        units["input_tokens"] = inp
+    prm = _usage_int(usage.get("prompt_tokens")) if "prompt_tokens" in usage else None
+    if prm is not None:
+        units["prompt_tokens"] = prm
+    total = _usage_int(usage.get("total_tokens")) if "total_tokens" in usage else None
+    out = None
+    if "completion_tokens" in usage:
+        out = _usage_int(usage.get("completion_tokens"))
+    elif "output_tokens" in usage:
+        out = _usage_int(usage.get("output_tokens"))
+    if total is not None and out is not None and total - out >= 0:
+        units["total_minus_output"] = total - out
+    if inp is not None:
+        cache_present = False
+        cache_ok = True
+        cache_total = 0
+        for key in ("cache_read_input_tokens", "cache_creation_input_tokens"):
+            if key in usage:
+                cache_present = True
+                value = _usage_int(usage[key])
+                if value is None:
+                    cache_ok = False
+                else:
+                    cache_total += value
+        if cache_present and cache_ok:
+            units["input_plus_cache"] = inp + cache_total
+    return units
+
+
+def cache_fields_seen(body):
+    if not isinstance(body, dict):
+        return False
+    usage = body.get("usage")
+    if not isinstance(usage, dict):
+        return False
+    return ("cache_read_input_tokens" in usage) or ("cache_creation_input_tokens" in usage)
+
+
+COMPARABLE_UNITS = ("input_tokens", "prompt_tokens", "total_minus_output")
+QUANTIZATION_LADDER = (8, 5, 3, 2, 1)  # checked largest first; k=1 always divides
+
+
+def _response_cache_seen(units, explicit):
+    if explicit is not None:
+        return bool(explicit)
+    return "input_plus_cache" in units
+
+
+def _comparable_units(units, cache_seen):
+    out = []
+    for unit in COMPARABLE_UNITS:
+        if unit not in units:
+            continue
+        # Anthropic excludes cached tokens from input_tokens, so it is not
+        # comparable for a response that reported cache units.
+        if unit == "input_tokens" and cache_seen:
+            continue
+        out.append(unit)
+    return out
+
+
+def usage_consistency(control_units_by_rep, probe_units_by_name,
+                      control_cache=None, probe_cache=None):
+    """Compare the input-side units a response reports, control vs probe.
+
+    Pure function. control_units_by_rep is a list indexed by repeat (None for a
+    missing control); probe_units_by_name maps a text name to a list indexed by
+    repeat (None for a missing probe). control_cache/probe_cache optionally
+    carry per-repeat booleans for "cache fields were seen"; when absent, the
+    presence of input_plus_cache is used as the signal. Notes only: this never
+    feeds the verdict.
+    """
+    control_units = list(control_units_by_rep or [])
+    control_cache_list = list(control_cache) if control_cache is not None else [None] * len(control_units)
+    while len(control_cache_list) < len(control_units):
+        control_cache_list.append(None)
+    probe_map = {name: list(arr or []) for name, arr in (probe_units_by_name or {}).items()}
+    probe_cache_map = {name: list(arr or []) for name, arr in (probe_cache or {}).items()}
+
+    disagreements = []
+    deltas = []
+    units_with_deltas = []
+    qualifying_responses = 0
+
+    reps = max([len(control_units)] + [len(v) for v in probe_map.values()] + [0])
+    for rep in range(reps):
+        c_units = control_units[rep] if rep < len(control_units) else None
+        c_comp = []
+        c_cache = None
+        if isinstance(c_units, dict):
+            c_cache = _response_cache_seen(c_units, control_cache_list[rep])
+            c_comp = _comparable_units(c_units, c_cache)
+            if len(c_comp) >= 2:
+                qualifying_responses += 1
+                values = [c_units[u] for u in c_comp]
+                if any(v != values[0] for v in values):
+                    disagreements.append("control repeat %d: %s" % (
+                        rep + 1, " ".join("%s=%d" % (u, c_units[u]) for u in c_comp)))
+        for name, arr in probe_map.items():
+            p_units = arr[rep] if rep < len(arr) else None
+            if not isinstance(p_units, dict):
+                continue
+            p_cache_exp = None
+            if name in probe_cache_map:
+                pc = probe_cache_map[name]
+                p_cache_exp = pc[rep] if rep < len(pc) else None
+            p_cache = _response_cache_seen(p_units, p_cache_exp)
+            p_comp = _comparable_units(p_units, p_cache)
+            if len(p_comp) >= 2:
+                qualifying_responses += 1
+                values = [p_units[u] for u in p_comp]
+                if any(v != values[0] for v in values):
+                    disagreements.append("%s repeat %d: %s" % (
+                        name, rep + 1, " ".join("%s=%d" % (u, p_units[u]) for u in p_comp)))
+            if not isinstance(c_units, dict):
+                continue
+            for unit in COMPARABLE_UNITS:
+                if unit == "input_tokens" and (c_cache or p_cache):
+                    continue
+                if unit not in c_units or unit not in p_units:
+                    continue
+                delta = p_units[unit] - c_units[unit]
+                deltas.append(delta)
+                if unit not in units_with_deltas:
+                    units_with_deltas.append(unit)
+                if delta < 0:
+                    disagreements.append("%s repeat %d: negative delta %d (%s)" % (name, rep + 1, delta, unit))
+
+    if deltas:
+        quantization_k = 0
+        for candidate in QUANTIZATION_LADDER:
+            if all(d % candidate == 0 for d in deltas):
+                quantization_k = candidate
+                break
+        usage_suspect = all(d % 5 == 0 for d in deltas)
+    else:
+        quantization_k = 0
+        usage_suspect = False
+
+    if qualifying_responses == 0:
+        agree = None
+    else:
+        agree = len(disagreements) == 0
+
+    return {
+        "agree": agree,
+        "units": [u for u in COMPARABLE_UNITS if u in units_with_deltas],
+        "disagreements": disagreements,
+        "deltas_checked": len(deltas),
+        "quantization_k": quantization_k,
+        "usage_suspect": usage_suspect,
+    }
+
+
 def family_verdict(matches, total, unstable=0):
     # All texts must agree for a match. One miss stays undecided (R3). A
     # mismatch needs two stably measured misses; with fewer than that, unstable
@@ -538,7 +717,8 @@ def probe_once(base, model, key, text, dialect_holder, timeout, attempts=3, budg
 def build_report(base, model, dialect, control_tokens_list, probe_results, family,
                  signature, matches, verdict, note, failed_probes=None,
                  total_texts=None, unstable_texts=None, budget=None,
-                 estimated_requests=None, baseline=None):
+                 estimated_requests=None, baseline=None, control_units=None,
+                 consistency=None):
     control_unstable = (len(control_tokens_list) > 1 and is_unstable(control_tokens_list))
     if family:
         reference = {"family": family, "signature": signature}
@@ -566,6 +746,7 @@ def build_report(base, model, dialect, control_tokens_list, probe_results, famil
             "min": min(control_tokens_list) if control_tokens_list else None,
             "max": max(control_tokens_list) if control_tokens_list else None,
             "unstable": control_unstable,
+            "units": list(control_units or []),
         },
         "reference": reference,
         "probes": probe_results,
@@ -575,6 +756,14 @@ def build_report(base, model, dialect, control_tokens_list, probe_results, famil
         "verdict": verdict,
         "note": note,
         "failed_probes": list(failed_probes or []),
+        "consistency": consistency or {
+            "agree": None,
+            "units": [],
+            "disagreements": [],
+            "deltas_checked": 0,
+            "quantization_k": 0,
+            "usage_suspect": False,
+        },
         "budget": {
             "estimated": estimated_requests,
             "limit": budget.limit if budget is not None else 0,
@@ -651,6 +840,10 @@ def run(args, api_key=None):
     dialect_holder = ["openai"]
     control_tokens_all = []
     tokens_by_name = {name: [] for name, _ in texts}
+    control_units_by_rep = []
+    control_cache_by_rep = []
+    probe_units_by_name = {name: [] for name, _ in texts}
+    probe_cache_by_name = {name: [] for name, _ in texts}
     endpoint_error = None
     usage_missing = False
     failed_probes = []
@@ -672,6 +865,8 @@ def run(args, api_key=None):
             usage_missing = True
             break
         control_tokens_all.append(ctrl_tok)
+        control_units_by_rep.append(usage_units(ctrl_body))
+        control_cache_by_rep.append(cache_fields_seen(ctrl_body))
         pause(args.sleep)
         for i, (name, text) in enumerate(texts):
             try:
@@ -681,12 +876,18 @@ def run(args, api_key=None):
                 if budget.exceeded:
                     budget_stopped = True
                     break
+                probe_units_by_name[name].append(None)
+                probe_cache_by_name[name].append(None)
                 failed_probes.append("%s (%s)" % (name, e))
                 continue
             tok = parse_usage_tokens(body)
             if tok is None:
+                probe_units_by_name[name].append(None)
+                probe_cache_by_name[name].append(None)
                 failed_probes.append("%s (no token usage in the response)" % name)
                 continue
+            probe_units_by_name[name].append(usage_units(body))
+            probe_cache_by_name[name].append(cache_fields_seen(body))
             tokens_by_name[name].append((rep, tok))
             if i < len(texts) - 1 or rep < args.repeat - 1:
                 pause(args.sleep)
@@ -697,6 +898,8 @@ def run(args, api_key=None):
 
     dialect = dialect_holder[0]
     control_unstable = (args.repeat > 1 and len(control_tokens_all) > 1 and is_unstable(control_tokens_all))
+    consistency = usage_consistency(control_units_by_rep, probe_units_by_name,
+                                    control_cache_by_rep, probe_cache_by_name)
 
     probe_results = []
     matches = None
@@ -705,6 +908,8 @@ def run(args, api_key=None):
         for idx, (name, text) in enumerate(texts):
             pairs = tokens_by_name[name]
             ref = signature[idx] if signature and idx < len(signature) else None
+            unit_entries = probe_units_by_name[name]
+            first_units = next((u for u in unit_entries if u is not None), {})
             tokens_repeats = [tok for _, tok in pairs]
             deltas = [tok - control_tokens_all[rep] for rep, tok in pairs if rep < len(control_tokens_all)]
             unstable_text = text_moved(deltas, ref)
@@ -733,6 +938,7 @@ def run(args, api_key=None):
                 "text_unstable": unstable_text,
                 "status": status,
                 "chars": len(text),
+                "units": first_units,
             })
         if signature and not control_unstable and not failed_probes and not budget_stopped:
             matches = sum(1 for p in probe_results if p["status"] == "match")
@@ -786,6 +992,13 @@ def run(args, api_key=None):
                          unstable_texts=len(unstable_texts))
         note = verdict_note(verdict, matches, n_texts, len(unstable_texts))
 
+    if verdict not in ("ENDPOINT UNAVAILABLE", "NO USAGE REPORTED"):
+        if consistency["agree"] is False:
+            note += "; usage-unit consistency failed (%s); recorded as a note only, the verdict is unchanged (R1)" % (
+                "; ".join(consistency["disagreements"][:2]))
+        if consistency["usage_suspect"]:
+            note += "; usage_suspect: every delta in every unit is a multiple of 5 (quantization step k=%d from 1,2,3,5,8); the counts may be rounded or synthesized (R1)" % consistency["quantization_k"]
+
     if baseline is not None and verdict in (
             "SIGNATURE MATCH", "PARTIAL MATCH", "SIGNATURE MISMATCH", "UNSTABLE ACCOUNTING"):
         note += "; " + BASELINE_CAVEAT
@@ -805,7 +1018,8 @@ def run(args, api_key=None):
                           matches, verdict, note, failed_probes,
                           total_texts=n_texts, unstable_texts=unstable_texts,
                           budget=budget, estimated_requests=estimated,
-                          baseline=baseline)
+                          baseline=baseline, control_units=control_units_by_rep,
+                          consistency=consistency)
 
     print("base: %s" % args.base)
     print("model: %s" % args.model)
@@ -958,6 +1172,60 @@ def selftest():
     check("non-int prompt_tokens rejected", lambda: parse_usage_tokens({"usage": {"prompt_tokens": "12"}}) is None)
     check("zero prompt_tokens is valid", lambda: parse_usage_tokens({"usage": {"prompt_tokens": 0}}) == 0)
     check("non-dict body yields None", lambda: parse_usage_tokens(None) is None)
+
+    # --- usage unit extraction ---
+    check("total_minus_output derived from total minus completion", lambda: (
+        usage_units({"usage": {"total_tokens": 100, "completion_tokens": 20}}) == {"total_minus_output": 80}))
+    check("total_minus_output derived from output_tokens", lambda: (
+        usage_units({"usage": {"total_tokens": 100, "output_tokens": 30}}) == {"total_minus_output": 70}))
+    check("total_minus_output omitted when the result is negative", lambda: (
+        "total_minus_output" not in usage_units({"usage": {"total_tokens": 10, "completion_tokens": 20}})))
+    check("input_plus_cache with one cache field", lambda: (
+        usage_units({"usage": {"input_tokens": 10, "cache_read_input_tokens": 4}})
+        == {"input_tokens": 10, "input_plus_cache": 14}))
+    check("input_plus_cache with both cache fields", lambda: (
+        usage_units({"usage": {"input_tokens": 10, "cache_read_input_tokens": 4, "cache_creation_input_tokens": 6}})
+        == {"input_tokens": 10, "input_plus_cache": 20}))
+    check("usage_units rejects boolean counts", lambda: usage_units({"usage": {"prompt_tokens": True}}) == {})
+    check("usage_units rejects float counts", lambda: usage_units({"usage": {"prompt_tokens": 12.0}}) == {})
+    check("usage_units rejects negative counts", lambda: usage_units({"usage": {"prompt_tokens": -1}}) == {})
+    check("usage_units empty when usage missing", lambda: (
+        usage_units({}) == {} and usage_units({"usage": {}}) == {}))
+
+    # --- usage-unit consistency (pure function) ---
+    def consistency_with_deltas(deltas):
+        control = [{"prompt_tokens": 100} for _ in deltas]
+        probes = {"T1": [{"prompt_tokens": 100 + d} for d in deltas]}
+        return usage_consistency(control, probes)
+
+    check("quantization k=2, not suspect", lambda: (lambda c: (
+        c["quantization_k"] == 2 and c["usage_suspect"] is False))(consistency_with_deltas([14, 20, 18, 26, 22])))
+    check("quantization k=5, usage_suspect", lambda: (lambda c: (
+        c["quantization_k"] == 5 and c["usage_suspect"] is True))(consistency_with_deltas([15, 25, 20, 35, 30])))
+    check("quantization k=8, not suspect", lambda: (lambda c: (
+        c["quantization_k"] == 8 and c["usage_suspect"] is False))(consistency_with_deltas([16, 24, 40, 32, 8])))
+    check("quantization k=3, not suspect", lambda: (lambda c: (
+        c["quantization_k"] == 3 and c["usage_suspect"] is False))(consistency_with_deltas([21, 15, 27, 33, 39])))
+    check("no deltas means k=0 and not suspect", lambda: (lambda c: (
+        c["quantization_k"] == 0 and c["usage_suspect"] is False and c["deltas_checked"] == 0))(
+        usage_consistency([], {})))
+    check("agree is None when no response has >= 2 comparable units", lambda: (
+        usage_consistency([{"prompt_tokens": 10}], {"T1": [{"prompt_tokens": 24}]})["agree"] is None))
+    check("unit disagreement is recorded, agree False", lambda: (lambda c: (
+        c["agree"] is False
+        and c["disagreements"] == ["T1 repeat 1: prompt_tokens=40 total_minus_output=38"]))(
+        usage_consistency([{"prompt_tokens": 10, "total_minus_output": 10}],
+                          {"T1": [{"prompt_tokens": 40, "total_minus_output": 38}]})))
+    check("negative delta counts as a consistency failure", lambda: (lambda c: (
+        c["agree"] is False
+        and any("negative delta" in d for d in c["disagreements"])))(
+        usage_consistency([{"prompt_tokens": 100, "total_minus_output": 100}],
+                          {"T1": [{"prompt_tokens": 90, "total_minus_output": 95}]})))
+    check("input_tokens skipped when cache units were reported", lambda: (lambda c: (
+        c["agree"] is True and c["deltas_checked"] == 2))(
+        usage_consistency([{"input_tokens": 10, "prompt_tokens": 10, "total_minus_output": 10}],
+                          {"T1": [{"input_tokens": 90, "prompt_tokens": 10, "total_minus_output": 10,
+                                   "input_plus_cache": 90}]})))
 
     # --- verdict selection (groups E+F+G, 12) ---
     check("verdict 5/5 signature match", lambda: family_verdict(5, 5) == "SIGNATURE MATCH")
@@ -1296,6 +1564,13 @@ def selftest():
                         body["usage"] = {"input_tokens": token}
                     else:
                         body["usage"] = {"prompt_tokens": token}
+                if scenario == "units_disagree":
+                    # prompt_tokens and total_minus_output both reported, but
+                    # they disagree by 7 on every response.
+                    usage = body["usage"]
+                    base_t = usage.get("prompt_tokens", usage.get("input_tokens"))
+                    usage["total_tokens"] = base_t + 7
+                    usage["completion_tokens"] = 0
                 self.send_json(200, body)
 
         server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
@@ -1394,6 +1669,107 @@ def selftest():
     code, out = scenario_run("anthropic_only", max_requests=1)
     check("mock budget exhausted on repeat 1 control yields probe incomplete", lambda: (
         code == 0 and "verdict: PROBE INCOMPLETE" in out and "ENDPOINT UNAVAILABLE" not in out))
+
+    # --- usage consistency: note-only behaviour (mock gateway) ---
+    def scenario_report(scenario, **overrides):
+        server, base = start_gateway(scenario)
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                target = os.path.join(tmpdir, "report.json")
+                opts = dict(overrides)
+                opts["out"] = target
+                run_capture(args_for(base, **opts))
+                with open(target, "r", encoding="utf-8") as fh:
+                    return json.load(fh)
+        finally:
+            stop_gateway(server)
+
+    code_ud, out_ud = scenario_run("units_disagree")
+    code_h, out_h = scenario_run("honest")
+    check("units_disagree verdict is unchanged (SIGNATURE MATCH)", lambda: (
+        "verdict: SIGNATURE MATCH" in out_ud and "matches: 5/5" in out_ud))
+    check("units_disagree note records consistency failure", lambda: "usage-unit consistency failed" in out_ud)
+    check("units_disagree note says the verdict is unchanged", lambda: "verdict is unchanged" in out_ud)
+
+    def verdict_line(out):
+        return next(l for l in out.splitlines() if l.startswith("verdict:"))
+
+    check("units_disagree verdict line identical to honest run", lambda: verdict_line(out_ud) == verdict_line(out_h))
+
+    ud_report = scenario_report("units_disagree")
+    check("units_disagree report consistency block", lambda: (
+        ud_report["consistency"]["agree"] is False
+        and ud_report["consistency"]["deltas_checked"] == 10
+        and ud_report["consistency"]["quantization_k"] == 1
+        and ud_report["consistency"]["usage_suspect"] is False))
+    check("units_disagree report carries units (control list, probe dicts)", lambda: (
+        len(ud_report["control"]["units"]) == 1
+        and ud_report["control"]["units"][0].get("prompt_tokens") == 5
+        and ud_report["control"]["units"][0].get("total_minus_output") == 12
+        and all(isinstance(p.get("units"), dict) for p in ud_report["probes"])))
+
+    honest_report = scenario_report("honest")
+    check("honest report consistency: agree None (single comparable unit), deltas 5", lambda: (
+        honest_report["consistency"]["agree"] is None
+        and honest_report["consistency"]["deltas_checked"] == 5
+        and honest_report["consistency"]["usage_suspect"] is False))
+
+    code, out = scenario_run("rounded")
+    check("rounded note gains usage_suspect and multiple of 5", lambda: (
+        "verdict: SIGNATURE MISMATCH" in out
+        and "usage_suspect" in out
+        and "multiple of 5" in out))
+    rounded_report = scenario_report("rounded")
+    check("rounded report usage_suspect True, quantization_k 5", lambda: (
+        rounded_report["consistency"]["usage_suspect"] is True
+        and rounded_report["consistency"]["quantization_k"] == 5))
+    check("honest note has no usage_suspect", lambda: "usage_suspect" not in out_h)
+
+    # --- every HTTP attempt goes through the budget (counter proof) ---
+    def budget_counter_case():
+        calls = {"n": 0}
+        real_post = post_json
+
+        def counting_post(url, payload, key, timeout):
+            calls["n"] += 1
+            return real_post(url, payload, key, timeout)
+
+        globals()["post_json"] = counting_post
+        try:
+            first_report = scenario_report("honest", repeat=2)
+            first_calls = calls["n"]
+            calls["n"] = 0
+            code2, out2 = scenario_run("honest", repeat=2, max_requests=4)
+            return first_calls, first_report["budget"]["used"], calls["n"], out2
+        finally:
+            globals()["post_json"] = real_post
+
+    b_calls, b_used, b4_calls, b4_out = budget_counter_case()
+    check("repeat=2 unlimited: counter equals report budget.used (12)", lambda: (
+        b_calls == 12 and b_used == 12))
+    check("max_requests=4: counter is exactly 4, verdict PROBE INCOMPLETE", lambda: (
+        b4_calls == 4 and "verdict: PROBE INCOMPLETE" in b4_out))
+
+    # --- the request estimate prints before the first request ---
+    def estimate_before_first_request():
+        real_post = post_json
+
+        def sentinel_post(url, payload, key, timeout):
+            print("__mock_request__")
+            return real_post(url, payload, key, timeout)
+
+        globals()["post_json"] = sentinel_post
+        try:
+            code, out = scenario_run("honest")
+        finally:
+            globals()["post_json"] = real_post
+        est = out.find("estimated requests: 6")
+        first = out.find("__mock_request__")
+        return est != -1 and first != -1 and est < first
+
+    check("estimated requests: 6 line prints before the first request", estimate_before_first_request)
+    code, out = scenario_run("honest", repeat=2)
+    check("repeat=2 prints estimated requests: 12", lambda: "estimated requests: 12" in out)
 
     # --- baselines: active load & integrity ---
     try:
@@ -1607,8 +1983,8 @@ def selftest():
     failed = [d for d, ok in results if not ok]
     passed = total - len(failed)
 
-    if total != 166:
-        print("SELFTEST (v3.1): internal error, expected 166 assertions, ran %d" % total, file=sys.stderr)
+    if total != 198:
+        print("SELFTEST (v3.1): internal error, expected 198 assertions, ran %d" % total, file=sys.stderr)
         return 2
     if failed:
         for d in failed:
