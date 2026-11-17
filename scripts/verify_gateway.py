@@ -57,7 +57,7 @@ BASELINE_DIR = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__f
 REFERENCE_ONLY_FILE = "_reference_only.json"
 BASELINE_SCHEMA_VERSION = 1
 BASELINE_CAVEAT = "third-party-gateway caveat: a wrapper can re-tokenize locally or forge usage, so this is WEAK evidence for the counting dialect, never the weights (R1)"
-INFERRED_MODEL_CAVEAT = "model ini belum diukur langsung pada text set ini; dipetakan lewat keluarga"
+INFERRED_MODEL_CAVEAT = "model not measured directly on this text set; mapped through the family"
 SINGLE_ROUTE_CAVEAT = "single-route caveat: the signature was measured on a single route, so a route-specific wrapper cannot be ruled out (R1)"
 
 
@@ -473,16 +473,33 @@ def _comparable_units(units, cache_seen):
     return out
 
 
+def _pair_diffs(pairs, label, units):
+    out = []
+    for u1, u2 in pairs:
+        if u1 in units and u2 in units:
+            out.append(((u1, u2), label, units[u1] - units[u2], units))
+    return out
+
+
 def usage_consistency(control_units_by_rep, probe_units_by_name,
-                      control_cache=None, probe_cache=None):
+                      control_cache=None, probe_cache=None, dialect=None):
     """Compare the input-side units a response reports, control vs probe.
 
     Pure function. control_units_by_rep is a list indexed by repeat (None for a
     missing control); probe_units_by_name maps a text name to a list indexed by
     repeat (None for a missing probe). control_cache/probe_cache optionally
     carry per-repeat booleans for "cache fields were seen"; when absent, the
-    presence of input_plus_cache is used as the signal. Notes only: this never
-    feeds the verdict.
+    presence of input_plus_cache is used as the signal. dialect optionally
+    carries the dialect holder value; "anthropic" forces the units check to
+    not applicable. Notes only: this never feeds the verdict.
+
+    A unit difference that is identical in every response is a constant offset:
+    it cancels under the control subtraction, is recorded in constant_offsets
+    and is never a disagreement. A difference that changes across responses is
+    recorded in disagreements and fails the check. The check is only
+    applicable when at least one response reported total_tokens (as
+    total_minus_output) and the dialect is not anthropic; otherwise agree is
+    None and no disagreement is produced.
     """
     control_units = list(control_units_by_rep or [])
     control_cache_list = list(control_cache) if control_cache is not None else [None] * len(control_units)
@@ -491,10 +508,17 @@ def usage_consistency(control_units_by_rep, probe_units_by_name,
     probe_map = {name: list(arr or []) for name, arr in (probe_units_by_name or {}).items()}
     probe_cache_map = {name: list(arr or []) for name, arr in (probe_cache or {}).items()}
 
+    pair_candidates = [(COMPARABLE_UNITS[i], COMPARABLE_UNITS[j])
+                       for i in range(len(COMPARABLE_UNITS))
+                       for j in range(i + 1, len(COMPARABLE_UNITS))]
+
     disagreements = []
+    negative_deltas = []
     deltas = []
     units_with_deltas = []
     qualifying_responses = 0
+    saw_total = False
+    pair_entries = {pair: [] for pair in pair_candidates}
 
     reps = max([len(control_units)] + [len(v) for v in probe_map.values()] + [0])
     for rep in range(reps):
@@ -504,12 +528,15 @@ def usage_consistency(control_units_by_rep, probe_units_by_name,
         if isinstance(c_units, dict):
             c_cache = _response_cache_seen(c_units, control_cache_list[rep])
             c_comp = _comparable_units(c_units, c_cache)
+            if "total_minus_output" in c_units:
+                saw_total = True
             if len(c_comp) >= 2:
                 qualifying_responses += 1
-                values = [c_units[u] for u in c_comp]
-                if any(v != values[0] for v in values):
-                    disagreements.append("control repeat %d: %s" % (
-                        rep + 1, " ".join("%s=%d" % (u, c_units[u]) for u in c_comp)))
+                label = "control repeat %d" % (rep + 1)
+                present = set(c_comp)
+                for (u1, u2), plabel, diff, snapshot in _pair_diffs(pair_candidates, label, c_units):
+                    if u1 in present and u2 in present:
+                        pair_entries[(u1, u2)].append((plabel, diff, snapshot))
         for name, arr in probe_map.items():
             p_units = arr[rep] if rep < len(arr) else None
             if not isinstance(p_units, dict):
@@ -520,12 +547,15 @@ def usage_consistency(control_units_by_rep, probe_units_by_name,
                 p_cache_exp = pc[rep] if rep < len(pc) else None
             p_cache = _response_cache_seen(p_units, p_cache_exp)
             p_comp = _comparable_units(p_units, p_cache)
+            if "total_minus_output" in p_units:
+                saw_total = True
             if len(p_comp) >= 2:
                 qualifying_responses += 1
-                values = [p_units[u] for u in p_comp]
-                if any(v != values[0] for v in values):
-                    disagreements.append("%s repeat %d: %s" % (
-                        name, rep + 1, " ".join("%s=%d" % (u, p_units[u]) for u in p_comp)))
+                label = "%s repeat %d" % (name, rep + 1)
+                present = set(p_comp)
+                for (u1, u2), plabel, diff, snapshot in _pair_diffs(pair_candidates, label, p_units):
+                    if u1 in present and u2 in present:
+                        pair_entries[(u1, u2)].append((plabel, diff, snapshot))
             if not isinstance(c_units, dict):
                 continue
             for unit in COMPARABLE_UNITS:
@@ -538,7 +568,7 @@ def usage_consistency(control_units_by_rep, probe_units_by_name,
                 if unit not in units_with_deltas:
                     units_with_deltas.append(unit)
                 if delta < 0:
-                    disagreements.append("%s repeat %d: negative delta %d (%s)" % (name, rep + 1, delta, unit))
+                    negative_deltas.append(("%s repeat %d" % (name, rep + 1), delta, unit))
 
     if deltas:
         quantization_k = 0
@@ -551,15 +581,39 @@ def usage_consistency(control_units_by_rep, probe_units_by_name,
         quantization_k = 0
         usage_suspect = False
 
-    if qualifying_responses == 0:
-        agree = None
+    applicable = bool(saw_total) and dialect != "anthropic"
+    constant_offsets = []
+    if applicable:
+        for (u1, u2), entries in pair_entries.items():
+            if not entries:
+                continue
+            signed = [diff for _, diff, _ in entries]
+            canonical = signed[0]
+            if all(diff == canonical for diff in signed):
+                if canonical != 0:
+                    constant_offsets.append(
+                        "%s - %s = %d in every response; cancelled by control subtraction" % (
+                            u1, u2, abs(canonical)))
+            else:
+                for label, diff, snapshot in entries:
+                    if diff != canonical:
+                        disagreements.append("%s: %s" % (
+                            label, " ".join("%s=%d" % (u, snapshot[u]) for u in (u1, u2))))
+        for label, delta, unit in negative_deltas:
+            disagreements.append("%s: negative delta %d (%s)" % (label, delta, unit))
+        agree = len(disagreements) == 0 if qualifying_responses else None
+        reason = None
     else:
-        agree = len(disagreements) == 0
+        agree = None
+        reason = "not applicable: this dialect reports no total_tokens"
 
     return {
         "agree": agree,
+        "applicable": applicable,
+        "reason": reason,
         "units": [u for u in COMPARABLE_UNITS if u in units_with_deltas],
         "disagreements": disagreements,
+        "constant_offsets": constant_offsets,
         "deltas_checked": len(deltas),
         "quantization_k": quantization_k,
         "usage_suspect": usage_suspect,
@@ -657,6 +711,24 @@ def pause(seconds):
         time.sleep(seconds)
 
 
+_OPENER = None
+
+
+def _opener():
+    """Lazily built module-level opener; building it re-reads the system cert
+    store on every call on Windows, so it is built once and reused."""
+    global _OPENER
+    if _OPENER is None:
+        _OPENER = urllib.request.build_opener(SafeRedirectHandler())
+    return _OPENER
+
+
+def _reset_opener():
+    """Test hook: drop the cached opener so the next call rebuilds it."""
+    global _OPENER
+    _OPENER = None
+
+
 def post_json(url, payload, key, timeout, return_headers=False):
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
@@ -671,7 +743,7 @@ def post_json(url, payload, key, timeout, return_headers=False):
         },
         method="POST",
     )
-    opener = urllib.request.build_opener(SafeRedirectHandler())
+    opener = _opener()
     with opener.open(req, timeout=timeout) as resp:
         body = json.loads(resp.read().decode("utf-8", errors="replace"))
         if return_headers:
@@ -701,7 +773,7 @@ def post_stream_json(url, payload, key, timeout):
         },
         method="POST",
     )
-    opener = urllib.request.build_opener(SafeRedirectHandler())
+    opener = _opener()
     with opener.open(req, timeout=timeout) as resp:
         raw = resp.read().decode("utf-8", errors="replace")
         headers = dict(resp.headers.items())
@@ -991,7 +1063,7 @@ def run_consistency_suite(base, model, key, dialect_holder, timeout, sleep, budg
     return suite
 
 
-def print_consistency_block(suite):
+def print_consistency_block(suite, usage=None):
     print("consistency:")
     for unit_name in (u for u, _ in CONSISTENCY_UNITS):
         entry = suite.get("linearity", {}).get(unit_name)
@@ -1016,14 +1088,26 @@ def print_consistency_block(suite):
         print("  side_evidence: model_requested=%s model_echo=%s model_matches=%s server=%s via=%s x_request_id=%s" % (
             se.get("model_requested"), se.get("model_echo"), se.get("model_matches"),
             se.get("server"), se.get("via"), se.get("x_request_id")))
+    for offset in (usage or {}).get("constant_offsets") or []:
+        print("  constant_offset: %s" % offset)
     for note in suite.get("notes", []):
         print("  note: %s" % note)
 
 
-CONSISTENCY_ESTIMATE_LINE = ("estimated consistency requests: 16 "
-                             "(1 control + 3 units x 5 k values; plus 2 determinism, "
-                             "plus 2 when --stream, plus 0 for headers because they ride "
-                             "on existing responses)")
+CONSISTENCY_ESTIMATE = 18  # 1 control + 3 units x 5 k values + 2 determinism
+CONSISTENCY_STREAM_EXTRA = 2  # one non-streaming plus one streaming request
+
+
+def consistency_estimate(stream=False):
+    return CONSISTENCY_ESTIMATE + (CONSISTENCY_STREAM_EXTRA if stream else 0)
+
+
+def consistency_estimate_line(stream=False):
+    if stream:
+        return ("estimated consistency requests: 20 "
+                "(1 control + 15 linearity + 2 determinism; plus 2 stream)")
+    return ("estimated consistency requests: 18 "
+            "(1 control + 15 linearity + 2 determinism; add 2 when --stream)")
 
 
 def run_consistency(args, api_key=None):
@@ -1047,11 +1131,12 @@ def run_consistency(args, api_key=None):
         print("error: --max-requests must be >= 0", file=sys.stderr)
         return 1
     stream = bool(getattr(args, "stream", False))
-    print(CONSISTENCY_ESTIMATE_LINE)
+    est = consistency_estimate(stream)
+    print(consistency_estimate_line(stream))
     max_requests = getattr(args, "max_requests", 0) or 0
     if max_requests:
         print("request limit: %d" % max_requests)
-        if 16 > max_requests:
+        if est > max_requests:
             print("warning: the estimate exceeds --max-requests; the suite will stop and note that the request budget was exhausted")
     budget = RequestBudget(max_requests)
     dialect_holder = ["openai"]
@@ -1071,7 +1156,7 @@ def run_consistency(args, api_key=None):
         "dialect": dialect_holder[0],
         "consistency": suite,
         "budget": {
-            "estimated": 16,
+            "estimated": est,
             "limit": budget.limit,
             "used": budget.used,
             "exceeded": bool(budget.exceeded),
@@ -1132,8 +1217,11 @@ def build_report(base, model, dialect, control_tokens_list, probe_results, famil
         "failed_probes": list(failed_probes or []),
         "consistency": consistency or {
             "agree": None,
+            "applicable": False,
+            "reason": "not applicable: this dialect reports no total_tokens",
             "units": [],
             "disagreements": [],
+            "constant_offsets": [],
             "deltas_checked": 0,
             "quantization_k": 0,
             "usage_suspect": False,
@@ -1204,8 +1292,11 @@ def run(args, api_key=None):
     print("estimated requests: %d (control + %d texts, repeat %d; retries and the max_tokens ladder can add more)" % (
         estimated, n_texts, args.repeat))
     with_consistency = bool(getattr(args, "with_consistency", False))
+    stream = bool(getattr(args, "stream", False))
+    consistency_est = consistency_estimate(stream)
     if with_consistency:
-        print("estimated requests: %d (%d probe + 16 consistency)" % (estimated + 16, estimated))
+        print("estimated requests: %d (%d probe + %d consistency)" % (
+            estimated + consistency_est, estimated, consistency_est))
     max_requests = getattr(args, "max_requests", 0) or 0
     if max_requests:
         print("request limit: %d" % max_requests)
@@ -1276,12 +1367,13 @@ def run(args, api_key=None):
     dialect = dialect_holder[0]
     control_unstable = (args.repeat > 1 and len(control_tokens_all) > 1 and is_unstable(control_tokens_all))
     consistency = usage_consistency(control_units_by_rep, probe_units_by_name,
-                                    control_cache_by_rep, probe_cache_by_name)
+                                    control_cache_by_rep, probe_cache_by_name,
+                                    dialect=dialect)
     consistency_suite = None
     if with_consistency:
         consistency_suite = run_consistency_suite(
             args.base, args.model, key, dialect_holder,
-            args.timeout, args.sleep, budget, stream=bool(getattr(args, "stream", False)))
+            args.timeout, args.sleep, budget, stream=stream)
         dialect = dialect_holder[0]
         consistency["linearity"] = consistency_suite["linearity"]
         consistency["determinism"] = consistency_suite["determinism"]
@@ -1385,8 +1477,9 @@ def run(args, api_key=None):
         if consistency["agree"] is False:
             note += "; usage-unit consistency failed (%s); recorded as a note only, the verdict is unchanged (R1)" % (
                 "; ".join(consistency["disagreements"][:2]))
-        if consistency["usage_suspect"]:
-            note += "; usage_suspect: every delta in every unit is a multiple of 5 (quantization step k=%d from 1,2,3,5,8); the counts may be rounded or synthesized (R1)" % consistency["quantization_k"]
+        elif consistency.get("constant_offsets"):
+            note += "; usage-unit constant offset (%s); recorded as a note only, the verdict is unchanged (R1)" % (
+                "; ".join(consistency["constant_offsets"][:2]))
 
     if baseline is not None and verdict in (
             "SIGNATURE MATCH", "PARTIAL MATCH", "SIGNATURE MISMATCH", "UNSTABLE ACCOUNTING"):
@@ -1402,7 +1495,11 @@ def run(args, api_key=None):
                 note += "; control %d is outside the recorded control range [%d,%d] for %s; recorded as a note only, the verdict is unchanged (R2)" % (
                     first_control, cr[0], cr[1], baseline["family"])
 
-    report_estimated = estimated + (16 if with_consistency else 0)
+    if consistency["usage_suspect"] and verdict not in ("ENDPOINT UNAVAILABLE", "NO USAGE REPORTED"):
+        note = ("warning: every delta in every unit is a multiple of 5, so a mismatch can come "
+                "from rounded or synthesized usage rather than from the tokenizer; ") + note
+
+    report_estimated = estimated + (consistency_est if with_consistency else 0)
     report = build_report(args.base, args.model, dialect, control_tokens_all,
                           probe_results, family, signature,
                           matches, verdict, note, failed_probes,
@@ -1437,7 +1534,7 @@ def run(args, api_key=None):
     print("verdict: %s" % verdict)
     print("note: %s" % note)
     if consistency_suite is not None:
-        print_consistency_block(consistency_suite)
+        print_consistency_block(consistency_suite, usage=consistency)
 
     if args.out:
         try:
@@ -1771,8 +1868,8 @@ def selftest():
     check("same-origin https redirect is allowed", same_origin_https_redirect_allowed)
 
     # --- post_json opener wiring (stdlib fakes, no network) ---
-    def post_json_fake():
-        captured = {}
+    def post_json_fake(times=1):
+        captured = {"count": 0}
         real_build_opener = urllib.request.build_opener
         real_urlopen = urllib.request.urlopen
 
@@ -1796,19 +1893,25 @@ def selftest():
 
         def fake_build_opener(*handlers):
             captured["handlers"] = handlers
+            captured["count"] += 1
             return FakeOpener()
 
         def fake_urlopen(*args, **kwargs):
             captured["urlopen_called"] = True
             raise AssertionError("urlopen must not be called")
 
+        _reset_opener()
         urllib.request.build_opener = fake_build_opener
         urllib.request.urlopen = fake_urlopen
         try:
-            captured["result"] = post_json("http://a.example/v1/chat/completions", {"x": 1}, "selftest-key", 5)
+            for i in range(times):
+                captured.setdefault("results", []).append(
+                    post_json("http://a.example/v1/chat/completions", {"x": i}, "selftest-key", 5))
+            captured["result"] = captured["results"][-1]
         finally:
             urllib.request.build_opener = real_build_opener
             urllib.request.urlopen = real_urlopen
+            _reset_opener()
         return captured
 
     post_fake = post_json_fake()
@@ -1820,6 +1923,8 @@ def selftest():
     check("post_json returns status and parsed body from the opener", lambda: (
         post_fake.get("result") == (200, {"usage": {"prompt_tokens": 7}})
         and post_fake.get("timeout") == 5))
+    reuse_fake = post_json_fake(times=2)
+    check("post_json reuses the cached opener across calls", lambda: reuse_fake["count"] == 1)
 
     # --- README probe block matches PROBES (permanent guard) ---
     def readme_probe_texts():
@@ -1899,7 +2004,7 @@ def selftest():
 
     # --- local mock gateway, no real network ---
     def start_gateway(scenario, signature=(14, 20, 18, 27, 22)):
-        state = {"control": 0, "counts": {}}
+        state = {"control": 0, "counts": {}, "requests": 0}
 
         def base_token(text):
             if scenario == "constant":
@@ -1981,6 +2086,7 @@ def selftest():
                     pass
 
             def do_POST(self):
+                state["requests"] += 1
                 try:
                     length = int(self.headers.get("Content-Length") or 0)
                     payload = json.loads(self.rfile.read(length) or b"{}")
@@ -1997,7 +2103,7 @@ def selftest():
                     except (BrokenPipeError, ConnectionResetError):
                         pass
                     return
-                if scenario == "anthropic_only" and self.path.endswith("/chat/completions"):
+                if scenario in ("anthropic_only", "anthropic_dialect") and self.path.endswith("/chat/completions"):
                     self.send_json(404, {"error": "not found"})
                     return
                 if scenario == "timeout":
@@ -2032,12 +2138,14 @@ def selftest():
                         body["usage"] = {"input_tokens": token}
                     else:
                         body["usage"] = {"prompt_tokens": token}
-                if scenario == "units_disagree":
-                    # prompt_tokens and total_minus_output both reported, but
-                    # they disagree by 7 on every response.
+                if scenario in ("units_disagree", "units_varying"):
+                    # prompt_tokens and total_minus_output both reported.
+                    # units_disagree: they disagree by 7 on every response (constant offset).
+                    # units_varying: the offset changes per request (strong disagreement).
                     usage = body["usage"]
                     base_t = usage.get("prompt_tokens", usage.get("input_tokens"))
-                    usage["total_tokens"] = base_t + 7
+                    offset = 7 if scenario == "units_disagree" else 7 + state["requests"]
+                    usage["total_tokens"] = base_t + offset
                     usage["completion_tokens"] = 0
                 if scenario == "side_evidence":
                     self.send_json(200, body, extra_headers={
@@ -2050,7 +2158,7 @@ def selftest():
 
         server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         server.daemon_threads = True
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread = threading.Thread(target=lambda: server.serve_forever(poll_interval=0.05), daemon=True)
         thread.start()
         return server, "http://127.0.0.1:%d/v1" % server.server_port
 
@@ -2109,6 +2217,13 @@ def selftest():
     code, out = scenario_run("anthropic_only")
     check("404 on openai dialect falls back to anthropic", lambda: "dialect: anthropic" in out and "verdict: SIGNATURE MATCH" in out)
 
+    code_ad, out_ad = scenario_run("anthropic_dialect", signature=(18, 25, 20, 36, 38),
+                                   model="anthropic/claude-sonnet-4.6")
+    check("anthropic_dialect yields SIGNATURE MATCH with the anthropic signature", lambda: (
+        code_ad == 0 and "dialect: anthropic" in out_ad and "verdict: SIGNATURE MATCH" in out_ad))
+    check("anthropic_dialect output carries no usage-unit consistency failure", lambda: (
+        "usage-unit consistency failed" not in out_ad))
+
     code, out = scenario_run("no_usage")
     check("mock no usage yields no usage verdict", lambda: "verdict: NO USAGE REPORTED" in out)
 
@@ -2148,8 +2263,11 @@ def selftest():
         code == 0 and "verdict: PROBE INCOMPLETE" in out and "ENDPOINT UNAVAILABLE" not in out))
 
     # --- usage consistency: note-only behaviour (mock gateway) ---
-    def scenario_report(scenario, **overrides):
-        server, base = start_gateway(scenario)
+    def scenario_report(scenario, signature=None, **overrides):
+        if signature is None:
+            server, base = start_gateway(scenario)
+        else:
+            server, base = start_gateway(scenario, signature=signature)
         try:
             with tempfile.TemporaryDirectory() as tmpdir:
                 target = os.path.join(tmpdir, "report.json")
@@ -2165,7 +2283,10 @@ def selftest():
     code_h, out_h = scenario_run("honest")
     check("units_disagree verdict is unchanged (SIGNATURE MATCH)", lambda: (
         "verdict: SIGNATURE MATCH" in out_ud and "matches: 5/5" in out_ud))
-    check("units_disagree note records consistency failure", lambda: "usage-unit consistency failed" in out_ud)
+    check("units_disagree note records a constant offset, not the strong failure", lambda: (
+        "usage-unit constant offset" in out_ud
+        and "prompt_tokens - total_minus_output = 7 in every response" in out_ud
+        and "usage-unit consistency failed" not in out_ud))
     check("units_disagree note says the verdict is unchanged", lambda: "verdict is unchanged" in out_ud)
 
     def verdict_line(out):
@@ -2175,10 +2296,14 @@ def selftest():
 
     ud_report = scenario_report("units_disagree")
     check("units_disagree report consistency block", lambda: (
-        ud_report["consistency"]["agree"] is False
+        ud_report["consistency"]["agree"] is True
+        and ud_report["consistency"]["applicable"] is True
         and ud_report["consistency"]["deltas_checked"] == 10
         and ud_report["consistency"]["quantization_k"] == 1
-        and ud_report["consistency"]["usage_suspect"] is False))
+        and ud_report["consistency"]["usage_suspect"] is False
+        and ud_report["consistency"]["disagreements"] == []
+        and ud_report["consistency"]["constant_offsets"] == [
+            "prompt_tokens - total_minus_output = 7 in every response; cancelled by control subtraction"]))
     check("units_disagree report carries units (control list, probe dicts)", lambda: (
         len(ud_report["control"]["units"]) == 1
         and ud_report["control"]["units"][0].get("prompt_tokens") == 5
@@ -2186,16 +2311,45 @@ def selftest():
         and all(isinstance(p.get("units"), dict) for p in ud_report["probes"])))
 
     honest_report = scenario_report("honest")
-    check("honest report consistency: agree None (single comparable unit), deltas 5", lambda: (
+    check("honest report consistency: not applicable, agree None, deltas 5", lambda: (
         honest_report["consistency"]["agree"] is None
+        and honest_report["consistency"]["applicable"] is False
+        and honest_report["consistency"]["reason"] == "not applicable: this dialect reports no total_tokens"
         and honest_report["consistency"]["deltas_checked"] == 5
         and honest_report["consistency"]["usage_suspect"] is False))
+
+    code_ad, out_ad = scenario_run("anthropic_dialect", signature=(18, 25, 20, 36, 38),
+                                   model="anthropic/claude-sonnet-4.6")
+    ad_report = scenario_report("anthropic_dialect", signature=(18, 25, 20, 36, 38),
+                                model="anthropic/claude-sonnet-4.6")
+    check("anthropic_dialect report consistency is not applicable", lambda: (
+        ad_report["consistency"]["applicable"] is False
+        and ad_report["consistency"]["agree"] is None
+        and ad_report["consistency"]["reason"] == "not applicable: this dialect reports no total_tokens"))
+
+    code_uv, out_uv = scenario_run("units_varying")
+    check("units_varying verdict is unchanged (SIGNATURE MATCH)", lambda: (
+        "verdict: SIGNATURE MATCH" in out_uv and "matches: 5/5" in out_uv))
+    check("units_varying note records the strong consistency failure", lambda: (
+        "usage-unit consistency failed" in out_uv and "verdict is unchanged" in out_uv))
+    uv_report = scenario_report("units_varying")
+    check("units_varying report consistency: agree False, no constant offset", lambda: (
+        uv_report["consistency"]["agree"] is False
+        and uv_report["consistency"]["applicable"] is True
+        and uv_report["consistency"]["constant_offsets"] == []
+        and len(uv_report["consistency"]["disagreements"]) >= 1))
 
     code, out = scenario_run("rounded")
     check("rounded note gains usage_suspect and multiple of 5", lambda: (
         "verdict: SIGNATURE MISMATCH" in out
-        and "usage_suspect" in out
-        and "multiple of 5" in out))
+        and "note: warning: every delta in every unit is a multiple of 5" in out
+        and "rounded or synthesized usage rather than from the tokenizer" in out))
+    rounded_note_line = next(l for l in out.splitlines() if l.startswith("note:"))
+    check("rounded note line starts with the warning", lambda: rounded_note_line.startswith("note: warning:"))
+    check("rounded verdict line still carries SIGNATURE MISMATCH", lambda: (
+        "verdict: SIGNATURE MISMATCH" in out))
+    honest_note_line = next(l for l in out_h.splitlines() if l.startswith("note:"))
+    check("honest note does not start with the warning", lambda: not honest_note_line.startswith("note: warning:"))
     rounded_report = scenario_report("rounded")
     check("rounded report usage_suspect True, quantization_k 5", lambda: (
         rounded_report["consistency"]["usage_suspect"] is True
@@ -2389,11 +2543,16 @@ def selftest():
     code, out = scenario_run("honest", model="deepseek/deepseek-v4-pro")
     check("inferred-model caveat on a model never measured on this text set", lambda: (
         "verdict: SIGNATURE MATCH" in out
-        and "model ini belum diukur langsung pada text set ini; dipetakan lewat keluarga" in out))
+        and "model not measured directly on this text set; mapped through the family" in out))
 
     code, out = scenario_run("honest", model="deepseek/deepseek-v4.1-flash")
     check("measured model carries no inferred-model caveat", lambda: (
-        "verdict: SIGNATURE MATCH" in out and "model ini belum diukur langsung" not in out))
+        "verdict: SIGNATURE MATCH" in out and "model not measured directly" not in out))
+
+    check("output caveats are ASCII-only and carry no Indonesian markers", lambda: all(
+        all(ord(c) < 128 for c in caveat)
+        and not any(marker in caveat for marker in ("dipetakan", "belum", "lewat", "keluarga"))
+        for caveat in (BASELINE_CAVEAT, INFERRED_MODEL_CAVEAT, SINGLE_ROUTE_CAVEAT)))
 
     code, out = scenario_run("honest", signature=(18, 25, 20, 36, 38), model="anthropic/claude-sonnet-4.6")
     check("single-route caveat on the single-route baseline", lambda: (
@@ -2565,7 +2724,7 @@ def selftest():
     check("--with-consistency verdict line identical to the plain run", lambda: (
         verdict_line(out_lh) == verdict_line(out_h3)))
     check("--with-consistency prints the combined estimate line", lambda: (
-        "estimated requests: 22 (6 probe + 16 consistency)" in out_lh))
+        "estimated requests: 24 (6 probe + 18 consistency)" in out_lh))
     check("--with-consistency prints a consistency block after the verdict", lambda: (
         "consistency:" in out_lh and out_lh.find("verdict:") < out_lh.find("consistency:")))
     check("--with-consistency report carries the consistency keys", lambda: all(
@@ -2587,7 +2746,7 @@ def selftest():
         finally:
             globals()["post_json"] = real_post
             stop_gateway(server)
-        est = out.find("estimated consistency requests: 16")
+        est = out.find("estimated consistency requests: 18")
         first = out.find("__mock_request__")
         return est != -1 and first != -1 and est < first
 
@@ -2614,10 +2773,49 @@ def selftest():
         finally:
             globals()["post_json"] = real_post
             stop_gateway(server)
-        return calls["n"], report["budget"]["used"], code
+        return calls["n"], report["budget"]["used"], code, out
 
-    c_calls, c_used, c_code = consistency_budget_counter()
+    c_calls, c_used, c_code, c_out = consistency_budget_counter()
     check("consistency-only: counter equals report budget.used", lambda: c_calls == c_used and c_code == 0)
+    check("consistency-only: printed estimate 18 equals the unrestricted request count", lambda: (
+        c_calls == 18 and "estimated consistency requests: 18" in c_out))
+
+    def consistency_budget_counter_stream():
+        calls = {"n": 0}
+        real_post = post_json
+        real_stream = post_stream_json
+
+        def counting_post(url, payload, key, timeout, **kwargs):
+            calls["n"] += 1
+            return real_post(url, payload, key, timeout, **kwargs)
+
+        def counting_stream(url, payload, key, timeout):
+            calls["n"] += 1
+            return real_stream(url, payload, key, timeout)
+
+        server, base = start_gateway("honest")
+        globals()["post_json"] = counting_post
+        globals()["post_stream_json"] = counting_stream
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                target = os.path.join(tmpdir, "report.json")
+                code, out = consistency_main_capture(
+                    ["consistency", "--base", base, "--model", "deepseek/deepseek-v4.1-flash-1017",
+                     "--sleep", "0", "--timeout", "5", "--stream", "--out", target])
+                with open(target, "r", encoding="utf-8") as fh:
+                    report = json.load(fh)
+        finally:
+            globals()["post_json"] = real_post
+            globals()["post_stream_json"] = real_stream
+            stop_gateway(server)
+        return calls["n"], report["budget"]["used"], code, out
+
+    s_calls, s_used, s_code, s_out = consistency_budget_counter_stream()
+    check("consistency --stream: counter equals report budget.used", lambda: s_calls == s_used and s_code == 0)
+    check("consistency --stream: printed estimate 20 equals the unrestricted request count", lambda: (
+        s_calls == 20 and "estimated consistency requests: 20" in s_out))
+    check("--with-consistency --stream prints estimated requests: 26 (6 probe + 20 consistency)", lambda: (
+        "estimated requests: 26 (6 probe + 20 consistency)" in out_so))
 
     def consistency_budget_stops_at_three():
         calls = {"n": 0}
@@ -2667,7 +2865,7 @@ def selftest():
         return calls["n"], report["budget"]["used"]
 
     wc_calls, wc_used = with_consistency_budget_counter()
-    check("--with-consistency: counter equals report budget.used", lambda: wc_calls == wc_used)
+    check("--with-consistency: counter equals report budget.used (24)", lambda: wc_calls == wc_used == 24)
 
     check("consistency --help exits 0", lambda: (
         consistency_main_capture(["consistency", "--help"])[0] == 0
@@ -2677,8 +2875,8 @@ def selftest():
     failed = [d for d, ok in results if not ok]
     passed = total - len(failed)
 
-    if total != 223:
-        print("SELFTEST (v3.1): internal error, expected 223 assertions, ran %d" % total, file=sys.stderr)
+    if total != 238:
+        print("SELFTEST (v3.1): internal error, expected 238 assertions, ran %d" % total, file=sys.stderr)
         return 2
     if failed:
         for d in failed:

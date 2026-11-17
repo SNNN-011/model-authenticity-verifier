@@ -123,8 +123,8 @@ Active baselines also enumerate `models_measured` and `models_inferred`
 from each other, with a union equal to `models`, and `models_measured` must
 not be empty; the loader fails closed otherwise, naming the file. A verdict
 that uses an active baseline appends a caveat when the requested model is in
-that baseline's `models_inferred` ("model ini belum diukur langsung pada
-text set ini; dipetakan lewat keluarga"), and, when the baseline's
+that baseline's `models_inferred` ("model not measured directly on this text set;
+mapped through the family"), and, when the baseline's
 `confidence` is `single-route`, a second caveat ("single-route caveat: the
 signature was measured on a single route, so a route-specific wrapper cannot
 be ruled out (R1)"). `control_range` is a note, never a verdict input: when
@@ -165,15 +165,28 @@ or output tokens, when both are reported and the result is not negative).
 `input_tokens` is skipped for a response that reported cache units
 (`cache_read_input_tokens` / `cache_creation_input_tokens`), because cached
 tokens are excluded from it; `input_plus_cache` is recorded but never
-compared. A response where two or more comparable units are present and they
-differ is recorded as a disagreement. A negative delta (probe reports fewer
+compared. A unit difference that is identical in every response is a
+constant offset: it cancels under the control subtraction, is recorded in
+`constant_offsets` (e.g. "prompt_tokens - total_minus_output = 7 in every
+response; cancelled by control subtraction") and never counts as a
+disagreement. A difference that changes between responses is recorded in
+`disagreements` and fails the check. A negative delta (probe reports fewer
 tokens than the control on the same unit) is also recorded as a failure.
+
+The units check is only applicable when at least one response reported
+`total_tokens` (as `total_minus_output`) and the dialect is not Anthropic:
+the Anthropic `/messages` dialect reports no `total_tokens`, so the check is
+`applicable: false`, `agree: null` with reason "not applicable: this
+dialect reports no total_tokens", and it can never produce a disagreement.
 
 Both of these are notes only. They are appended to the `note` string, never
 used to pick or change a verdict (R1, R5). When every delta in every unit is a
-multiple of 5 and at least one delta exists, the note gains `usage_suspect`
-with the quantization step: the largest k in the ladder 1, 2, 3, 5, 8 that
-divides every delta. `quantization_k` is 0 when there are no deltas.
+multiple of 5 and at least one delta exists, the note STARTS with a warning
+that a mismatch can come from rounded or synthesized usage rather than from
+the tokenizer ("warning: every delta in every unit is a multiple of 5, so a
+mismatch can come from rounded or synthesized usage rather than from the
+tokenizer; ..."); `quantization_k` is the largest k in the ladder 1, 2, 3,
+5, 8 that divides every delta, and is 0 when there are no deltas.
 
 Every HTTP attempt, including retries and the max_tokens ladder rungs, passes
 through the request budget (`--max-requests`). The estimated request count is
@@ -247,11 +260,10 @@ only (R1). Side evidence alone never changes a verdict.
 Every consistency request goes through the same `RequestBudget` as the
 probes; exhaustion stops the suite and records `consistency incomplete:
 request budget exhausted` as a note only. The consistency-only path prints
-`estimated consistency requests: 16 (1 control + 3 units x 5 k values; plus
-2 determinism, plus 2 when --stream, plus 0 for headers because they ride
-on existing responses)` before the first request; `--with-consistency`
+`estimated consistency requests: 18 (1 control + 15 linearity + 2 determinism; add 2 when --stream)` before the first request (`estimated consistency requests: 20 (1 control + 15 linearity + 2 determinism; plus 2 stream)` with `--stream`); `--with-consistency`
 prints the probe estimate followed by a combined line, e.g.
-`estimated requests: 22 (6 probe + 16 consistency)`. Headers ride on
+`estimated requests: 24 (6 probe + 18 consistency)`
+(`estimated requests: 26 (6 probe + 20 consistency)` with `--stream`). Headers ride on
 existing responses, so they add no requests.
 
 ## The probe texts

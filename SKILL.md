@@ -132,13 +132,24 @@ response reports, control vs probe: `input_tokens`, `prompt_tokens` and
 `total_minus_output` (`total_tokens` minus the completion or output tokens,
 when both are reported and the result is not negative). `input_tokens` is
 skipped for a response that reported cache units, because cached tokens are
-excluded from it; `input_plus_cache` is recorded but never compared. A
-response whose comparable units differ, and any negative delta, are recorded
-as notes only: they are appended to the `note` string and never change the
-verdict (R1, R5). When every delta in every unit is a multiple of 5 (and at
-least one delta exists), the note gains `usage_suspect` with the
-`quantization_k`: the largest k in the ladder 1, 2, 3, 5, 8 dividing every
-delta; 0 when there are no deltas. Every HTTP attempt, retries and
+excluded from it; `input_plus_cache` is recorded but never compared. A unit difference that is identical in every response is a constant
+offset: it cancels under the control subtraction, is recorded in
+`constant_offsets` and never counts as a disagreement. A difference that
+changes between responses is recorded in `disagreements` and fails the check.
+Any negative delta is also a failure. The units check is only applicable
+when at least one response reported `total_tokens` (as `total_minus_output`)
+and the dialect is not Anthropic: the Anthropic `/messages` dialect reports
+no `total_tokens`, so the check is `applicable: false`, `agree: null` with
+reason "not applicable: this dialect reports no total_tokens", and it can
+never produce a disagreement. All of this is notes only: the results are
+appended to the `note` string and never change the verdict (R1, R5). When
+every delta in every unit is a multiple of 5 (and at least one delta exists),
+the note STARTS with a warning that a mismatch can come from rounded or
+synthesized usage rather than from the tokenizer ("warning: every delta in
+every unit is a multiple of 5, so a mismatch can come from rounded or
+synthesized usage rather than from the tokenizer; ..."); `quantization_k` is
+the largest k in the ladder 1, 2, 3, 5, 8 dividing every delta; 0 when there
+are no deltas. Every HTTP attempt, retries and
 max_tokens ladder rungs included, passes through the request budget, and the
 estimated request count is printed before the run starts.
 
@@ -177,12 +188,15 @@ without `--with-consistency`.
   is a side-evidence note only (R1).
 
 The `consistency` report block gains `linearity`, `determinism`, `stream`
-(only with `--stream`), `side_evidence` and `notes`. The consistency-only
-path prints `estimated consistency requests: 16 (1 control + 3 units x 5 k
-values; plus 2 determinism, plus 2 when --stream, plus 0 for headers
-because they ride on existing responses)` before the first request;
+(only with `--stream`), `side_evidence` and `notes`. The consistency block
+gains `applicable`, `reason` and `constant_offsets`. The consistency-only
+path prints `estimated consistency requests: 18 (1 control + 15 linearity +
+2 determinism; add 2 when --stream)` before the first request (`estimated
+consistency requests: 20 (1 control + 15 linearity + 2 determinism; plus 2
+stream)` with `--stream`);
 `--with-consistency` prints the probe estimate then a combined line, e.g.
-`estimated requests: 22 (6 probe + 16 consistency)`. Consistency
+`estimated requests: 24 (6 probe + 18 consistency)`
+(`estimated requests: 26 (6 probe + 20 consistency)` with `--stream`). Consistency
 exhaustion of the budget stops the suite and records `consistency
 incomplete: request budget exhausted` as a note only.
 
@@ -230,8 +244,8 @@ Active baselines also enumerate `models_measured` and `models_inferred`
 (schema_version stays 1): disjoint lists of non-empty strings whose union
 equals `models`, with `models_measured` non-empty; the loader fails closed
 otherwise, naming the file. When the requested model is in the baseline's
-`models_inferred`, the verdict note appends "model ini belum diukur langsung
-pada text set ini; dipetakan lewat keluarga"; when the baseline's
+`models_inferred`, the verdict note appends "model not measured directly on
+this text set; mapped through the family"; when the baseline's
 `confidence` is `single-route`, the note appends "single-route caveat: the
 signature was measured on a single route, so a route-specific wrapper cannot
 be ruled out (R1)". Numeric loader fields reject booleans, floats and

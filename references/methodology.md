@@ -132,8 +132,8 @@ the control-instability and family-unstable cases) carries a
 third-party-gateway caveat: a wrapper can re-tokenize locally or forge
 usage, so a match is WEAK evidence for the counting dialect, never the
 weights (R1). When the requested model sits in that baseline's
-`models_inferred`, the note also carries "model ini belum diukur langsung
-pada text set ini; dipetakan lewat keluarga". When the baseline's
+`models_inferred`, the note also carries "model not measured directly on
+this text set; mapped through the family". When the baseline's
 `confidence` is `single-route`, the note also carries "single-route
 caveat: the signature was measured on a single route, so a route-specific
 wrapper cannot be ruled out (R1)".
@@ -155,17 +155,32 @@ or output tokens when both are reported and the result is not negative, and
 `input_plus_cache` = `input_tokens` plus the cache read/creation counts) and
 cross-checks them, per repeat, control vs probe. Only the first three are
 comparable; `input_tokens` is skipped for a response that reported cache
-units, because Anthropic excludes cached tokens from it. A response whose
-comparable units disagree, and any negative delta (probe below control on the
-same unit), are recorded as consistency failures in the note: a counting side
-that does not agree with itself is worth reporting, but it proves nothing
-about the weights, so it never changes the verdict (R1, R5).
+units, because Anthropic excludes cached tokens from it. A unit difference
+that is identical in every response is a constant offset: it cancels under
+the control subtraction, is recorded in `constant_offsets` (e.g.
+"prompt_tokens - total_minus_output = 7 in every response; cancelled by
+control subtraction") and never counts as a disagreement. A difference that
+changes between responses is recorded in `disagreements` and fails the
+check. Any negative delta (probe below control on the same unit) is also a
+failure. The check is only applicable when at least one response reported
+`total_tokens` (as `total_minus_output`) and the dialect is not Anthropic:
+the Anthropic `/messages` dialect reports no `total_tokens`, so the check
+is recorded as `applicable: false`, `agree: null` with reason "not
+applicable: this dialect reports no total_tokens", and it can never produce
+a disagreement. All of this is recorded as a consistency failure in the
+note: a counting side that does not agree with itself is worth reporting,
+but it proves nothing about the weights, so it never changes the verdict
+(R1, R5).
 
 When every delta in every unit is a multiple of 5 and at least one delta
-exists, the note gains `usage_suspect`: the counts may be rounded or
-synthesized. The `quantization_k` reported next to it is the largest k in the
-ladder 1, 2, 3, 5, 8 that divides every delta in every unit; `quantization_k`
-is 0 when no deltas exist. Both are notes only and are appended for every
+exists, the note STARTS with a warning that a mismatch can come from rounded
+or synthesized usage rather than from the tokenizer ("warning: every delta
+in every unit is a multiple of 5, so a mismatch can come from rounded or
+synthesized usage rather than from the tokenizer; ..."): `usage_suspect` is
+set and the counts may be rounded or synthesized. The `quantization_k`
+reported is the largest k in the ladder 1, 2, 3, 5, 8 that divides every
+delta in every unit; `quantization_k` is 0 when no deltas exist. Both are
+notes only and are appended for every
 outcome that reached a note, except `ENDPOINT UNAVAILABLE` and
 `NO USAGE REPORTED`, where no units exist to compare.
 
@@ -197,11 +212,14 @@ requests; `--stream` adds a non-streaming and a streaming send. Headers
 ride on the first consistency response and add no requests. Exhausting the
 budget stops the suite and records `consistency incomplete: request budget
 exhausted` as a note only. The estimates printed before the first request
-are `estimated consistency requests: 16 (1 control + 3 units x 5 k values;
-plus 2 determinism, plus 2 when --stream, plus 0 for headers because they
-ride on existing responses)` for the consistency-only path, and, with
+are `estimated consistency requests: 18 (1 control + 15 linearity + 2
+determinism; add 2 when --stream)` for the consistency-only path
+(`estimated consistency requests: 20 (1 control + 15 linearity + 2
+determinism; plus 2 stream)` with `--stream`), and, with
 `--with-consistency`, the probe estimate followed by a combined line such as
-`estimated requests: 22 (6 probe + 16 consistency)`.
+`estimated requests: 24 (6 probe + 18 consistency)`
+(`estimated requests: 26 (6 probe + 20 consistency)` with `--stream`). The
+consistency block gains `applicable`, `reason` and `constant_offsets`.
 
 ### Usage linearity vs repetition
 
