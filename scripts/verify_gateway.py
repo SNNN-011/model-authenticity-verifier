@@ -74,17 +74,36 @@ class RequestBudget:
         self.used += 1
 
 
+def _origin(url):
+    """(scheme, hostname, port) with default ports filled in; None if unparseable."""
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except ValueError:
+        return None
+    scheme = (parts.scheme or "").lower()
+    host = (parts.hostname or "").lower()
+    if not scheme or not host:
+        return None
+    try:
+        port = parts.port
+    except ValueError:
+        return None
+    if port is None:
+        port = {"http": 80, "https": 443}.get(scheme)
+    return (scheme, host, port)
+
+
 class SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
-    """Refuse redirects that would carry the auth headers to another host."""
+    """Refuse redirects that would carry the auth headers to another origin."""
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         old_url = req.full_url
         target = urllib.parse.urljoin(old_url, newurl)
-        old_host = urllib.parse.urlsplit(old_url).netloc.lower()
-        new_host = urllib.parse.urlsplit(target).netloc.lower()
-        if old_host != new_host:
+        old_origin = _origin(old_url)
+        new_origin = _origin(target)
+        if old_origin is None or new_origin is None or old_origin != new_origin:
             raise ProbeFailure(
-                "redirect to a different host refused (HTTP %d): auth headers are not forwarded across hosts" % code)
+                "redirect to a different origin refused (HTTP %d): scheme, host or port changed; auth headers are not forwarded" % code)
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
@@ -733,6 +752,14 @@ def selftest():
     check("decision: 3 match 2 unstable is unstable", lambda: decide(family="deepseek", matches=3, total=5, unstable_texts=2) == "UNSTABLE ACCOUNTING")
     check("decision: 2 match 1 unstable 2 mismatch is mismatch", lambda: decide(family="deepseek", matches=2, total=5, unstable_texts=1) == "SIGNATURE MISMATCH")
 
+    check("verdict total=0 is unmeasured family", lambda: family_verdict(0, 0) == "UNMEASURED FAMILY")
+    check("verdict total=0 no matches is unmeasured family", lambda: family_verdict(None, 0) == "UNMEASURED FAMILY")
+    check("verdict total=1 one match is signature match", lambda: family_verdict(1, 1, 0) == "SIGNATURE MATCH")
+    check("verdict total=1 mismatch falls through to signature mismatch", lambda: family_verdict(0, 1, 0) == "SIGNATURE MISMATCH")
+    check("verdict total=1 all unstable is unstable accounting", lambda: family_verdict(0, 1, 1) == "UNSTABLE ACCOUNTING")
+    check("family_verdict matches the v3.0 rows for total=5 unstable=0", lambda: [family_verdict(m, 5, 0) for m in range(6)] == [
+        "SIGNATURE MISMATCH", "SIGNATURE MISMATCH", "SIGNATURE MISMATCH", "SIGNATURE MISMATCH",
+        "PARTIAL MATCH", "SIGNATURE MATCH"])
     # --- ladder, retries and the partial-run verdict (group I, 7) ---
     check("ladder starts at 64", lambda: MAX_TOKENS_LADDER[0] == 64)
     check("ladder ends at 2048", lambda: MAX_TOKENS_LADDER[-1] == 2048)
@@ -777,24 +804,99 @@ def selftest():
     check("--key=VALUE exits before any request", lambda: reject_flag("--key=secret"))
 
     # --- redirect guard ---
-    def cross_host_redirect_refused():
+    def redirect_with(old_url, new_url):
         handler = SafeRedirectHandler()
-        req = urllib.request.Request("http://a.example/v1/chat/completions")
+        req = urllib.request.Request(old_url)
+        try:
+            return handler.redirect_request(req, None, 302, "Found", {}, new_url)
+        except ProbeFailure:
+            return None
+
+    def cross_host_redirect_refused():
+        old = redirect_with("http://a.example/v1/chat/completions", "http://b.example/steal")
+        return old is None
+
+    def different_port_redirect_refused():
+        return redirect_with("http://a.example:8080/v1/chat/completions", "http://a.example:9090/v1/steal") is None
+
+    def https_to_http_same_host_refused():
+        return redirect_with("https://a.example/v1/chat/completions", "http://a.example/v1/messages") is None
+
+    def _redirect_error_clean():
+        handler = SafeRedirectHandler()
+        req = urllib.request.Request("http://a.example/v1/chat/completions",
+                                     headers={"Authorization": "Bearer selftest-key"})
         try:
             handler.redirect_request(req, None, 302, "Found", {}, "http://b.example/steal")
             return False
         except ProbeFailure as e:
-            return "different host" in str(e) and "secret" not in str(e)
+            return "different origin" in str(e) and "selftest-key" not in str(e)
 
     def same_host_redirect_allowed():
-        handler = SafeRedirectHandler()
-        req = urllib.request.Request("http://a.example/v1/chat/completions")
-        return isinstance(handler.redirect_request(req, None, 302, "Found", {},
-                                                   "http://a.example/v1/messages"),
+        return isinstance(redirect_with("http://a.example/v1/chat/completions", "http://a.example/v1/messages"),
+                          urllib.request.Request)
+
+    def same_origin_https_redirect_allowed():
+        return isinstance(redirect_with("https://a.example/v1/chat/completions", "https://a.example/v1/messages"),
                           urllib.request.Request)
 
     check("cross-host redirect is refused", cross_host_redirect_refused)
+    check("cross-host redirect carries no key material", lambda: _redirect_error_clean())
+    check("different port redirect is refused", different_port_redirect_refused)
+    check("https to http same host redirect is refused", https_to_http_same_host_refused)
     check("same-host redirect is allowed", same_host_redirect_allowed)
+    check("same-origin https redirect is allowed", same_origin_https_redirect_allowed)
+
+    # --- post_json opener wiring (stdlib fakes, no network) ---
+    def post_json_fake():
+        captured = {}
+        real_build_opener = urllib.request.build_opener
+        real_urlopen = urllib.request.urlopen
+
+        class FakeResponse:
+            status = 200
+
+            def read(self):
+                return b'{"usage": {"prompt_tokens": 7}}'
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        class FakeOpener:
+            def open(self, req, timeout=None):
+                captured["req"] = req
+                captured["timeout"] = timeout
+                return FakeResponse()
+
+        def fake_build_opener(*handlers):
+            captured["handlers"] = handlers
+            return FakeOpener()
+
+        def fake_urlopen(*args, **kwargs):
+            captured["urlopen_called"] = True
+            raise AssertionError("urlopen must not be called")
+
+        urllib.request.build_opener = fake_build_opener
+        urllib.request.urlopen = fake_urlopen
+        try:
+            captured["result"] = post_json("http://a.example/v1/chat/completions", {"x": 1}, "selftest-key", 5)
+        finally:
+            urllib.request.build_opener = real_build_opener
+            urllib.request.urlopen = real_urlopen
+        return captured
+
+    post_fake = post_json_fake()
+    check("post_json builds opener with SafeRedirectHandler", lambda: (
+        isinstance(post_fake.get("handlers"), tuple)
+        and len(post_fake["handlers"]) == 1
+        and isinstance(post_fake["handlers"][0], SafeRedirectHandler)))
+    check("post_json does not use urllib.request.urlopen", lambda: not post_fake.get("urlopen_called"))
+    check("post_json returns status and parsed body from the opener", lambda: (
+        post_fake.get("result") == (200, {"usage": {"prompt_tokens": 7}})
+        and post_fake.get("timeout") == 5))
 
     # --- report safety & shape (group H, 2) ---
     sentinel = "sk-sentinel-never-in-report"
@@ -974,12 +1076,20 @@ def selftest():
     code, out = scenario_run("honest", max_requests=2)
     check("mock request budget yields probe incomplete", lambda: "verdict: PROBE INCOMPLETE" in out and "budget" in out)
 
+    code, out = scenario_run("honest", repeat=2, max_requests=6)
+    check("mock budget exhausted on repeat 2 control yields probe incomplete", lambda: (
+        code == 0 and "verdict: PROBE INCOMPLETE" in out and "ENDPOINT UNAVAILABLE" not in out))
+
+    code, out = scenario_run("anthropic_only", max_requests=1)
+    check("mock budget exhausted on repeat 1 control yields probe incomplete", lambda: (
+        code == 0 and "verdict: PROBE INCOMPLETE" in out and "ENDPOINT UNAVAILABLE" not in out))
+
     total = len(results)
     failed = [d for d, ok in results if not ok]
     passed = total - len(failed)
 
-    if total != 111:
-        print("SELFTEST (v3.1): internal error, expected 111 assertions, ran %d" % total, file=sys.stderr)
+    if total != 126:
+        print("SELFTEST (v3.1): internal error, expected 126 assertions, ran %d" % total, file=sys.stderr)
         return 2
     if failed:
         for d in failed:
